@@ -1,0 +1,43 @@
+# Secrets & credentials
+.env
+.env.local
+.env.*.local
+
+# Claude Code project notes (may contain deployment details)
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Playwright test artifacts
+.playwright-cli/
+
+# Data & database volumes
+data/
+postgres_data/
+
+# Docker local overrides
+docker-compose.override.yml
+
+# OS & IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs & temp
+*.log
+tmp/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

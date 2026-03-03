@@ -1,0 +1,67 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: defender_explorer_db
+    environment:
+      TZ: America/New_York
+      POSTGRES_USER: defender
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: defender_explorer
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U defender -d defender_explorer"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: defender_explorer_app
+    environment:
+      TZ: America/New_York
+      DATABASE_URL: postgresql+asyncpg://defender:${POSTGRES_PASSWORD}@db:5432/defender_explorer
+      VDM_PATH: /data/vdm
+      EXTRACTED_PATH: /data/extracted
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Mount local VDM files (optional)
+      - ${VDM_PATH:-./data/vdm}:/data/vdm:ro
+      # Mount pre-extracted data (optional)
+      - ${EXTRACTED_PATH:-./data/extracted}:/data/extracted:ro
+    mem_limit: 6g
+    memswap_limit: 6g
+    depends_on:
+      db:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  postgres_data:
