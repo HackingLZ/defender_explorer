@@ -21,8 +21,11 @@ frontend/dist/
 # Playwright test artifacts
 .playwright-cli/
 
-# Data & database volumes
-data/
+# Data & database volumes — track dir structure, ignore content
+data/vdm/*
+!data/vdm/.gitkeep
+data/extracted/*
+!data/extracted/.gitkeep
 postgres_data/
 
 # Docker local overrides
