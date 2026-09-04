@@ -165,10 +165,11 @@ async def start_scheduler_on_startup():
     global _auto_sync_enabled, _auto_sync_time
 
     saved = await _load_schedule_from_db()
-    if saved and saved.get("enabled"):
+    if saved is not None:
         sync_time = saved.get("time", "03:00")
-        logger.info(f"Restoring saved schedule: enabled=True, time={sync_time}")
-        await set_schedule(True, sync_time)
+        enabled = bool(saved.get("enabled", False))
+        logger.info("Restoring saved schedule: enabled=%s, time=%s", enabled, sync_time)
+        await set_schedule(enabled, sync_time)
     else:
         logger.info("No saved schedule found, enabling default 3 AM daily sync")
         await set_schedule(True, "03:00")

@@ -71,6 +71,7 @@ export default function AdvancedSearch({
   }
 
   const addQuickFilter = (field: string, value: string) => {
+    if (filters.length >= 20) return
     onFiltersChange([...filters, { field, operator: 'equals', value }])
     setShowQuickFilters(false)
   }
@@ -233,6 +234,7 @@ export default function AdvancedSearch({
             <span className="text-sm font-medium text-text-bright">Filter Builder</span>
             <button
               onClick={addFilter}
+              disabled={filters.length >= 20}
               className="text-xs text-amber hover:text-amber-bright flex items-center gap-1"
             >
               <Plus className="h-3 w-3" />

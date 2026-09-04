@@ -1,9 +1,16 @@
 """Report generation service for threats and ASR rules."""
 
+import asyncio
+from collections import OrderedDict
+import hashlib
 import io
+from pathlib import Path
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
+
+from .process_worker import run_worker, WorkerTimeoutError
 
 # HTML template for threat reports
 THREAT_REPORT_TEMPLATE = """
@@ -423,22 +430,80 @@ def generate_asr_report_html(
     return html
 
 
-def generate_pdf_from_html(html: str) -> bytes:
-    """
-    Generate PDF from HTML content.
+class ReportBusyError(RuntimeError):
+    pass
 
-    Requires weasyprint to be installed.
 
-    Raises:
-        RuntimeError: If weasyprint is not installed or PDF generation fails.
-    """
+class ReportTimeoutError(RuntimeError):
+    pass
+
+
+_PDF_CONCURRENCY = 2
+_PDF_TIMEOUT = 20
+_PDF_MAX_BYTES = 8 * 1024 * 1024
+_PDF_CACHE_BYTES = 32 * 1024 * 1024
+_pdf_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+_pdf_jobs: dict[str, asyncio.Task] = {}
+
+
+def _deny_report_resource(url, *args, **kwargs):
+    raise ValueError("External resources are not supported in reports")
+
+
+def _render_pdf_worker(html: str, output_path: str) -> None:
+    from weasyprint import HTML
+    pdf = HTML(string=html, url_fetcher=_deny_report_resource).write_pdf()
+    if len(pdf) > _PDF_MAX_BYTES:
+        raise ValueError("Report exceeds maximum output size")
+    Path(output_path).write_bytes(pdf)
+
+
+async def _render_and_cache(key: str, html: str) -> bytes:
     try:
-        from weasyprint import HTML
-        return HTML(string=html).write_pdf()
-    except ImportError:
-        raise RuntimeError(
-            "PDF export requires weasyprint. "
-            "Install it with: pip install weasyprint"
+        pdf = await run_worker(
+            _render_pdf_worker, (html,), timeout=_PDF_TIMEOUT,
+            max_output=_PDF_MAX_BYTES,
         )
-    except Exception as e:
-        raise RuntimeError(f"PDF generation failed: {e}") from e
+        _pdf_cache[key] = (time.monotonic(), pdf)
+        while len(_pdf_cache) > 32 or sum(len(item[1]) for item in _pdf_cache.values()) > _PDF_CACHE_BYTES:
+            _pdf_cache.popitem(last=False)
+        return pdf
+    except WorkerTimeoutError as exc:
+        raise ReportTimeoutError("PDF generation timed out") from exc
+    finally:
+        _pdf_jobs.pop(key, None)
+
+
+def _observe_report_job(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()  # Retrieve failures even after all request waiters leave.
+
+
+async def generate_pdf_from_html(html: str) -> bytes:
+    """Render in a bounded process; identical requests share work and cache."""
+    encoded = html.encode("utf-8")
+    if len(encoded) > 2 * 1024 * 1024:
+        raise RuntimeError("Report exceeds maximum input size")
+    key = hashlib.sha256(encoded).hexdigest()
+    cached = _pdf_cache.get(key)
+    if cached is not None:
+        if time.monotonic() - cached[0] < 300:
+            _pdf_cache.move_to_end(key)
+            return cached[1]
+        del _pdf_cache[key]
+    task = _pdf_jobs.get(key)
+    if task is None:
+        if len(_pdf_jobs) >= _PDF_CONCURRENCY:
+            raise ReportBusyError("PDF workers are busy; retry shortly")
+        task = asyncio.create_task(_render_and_cache(key, html))
+        _pdf_jobs[key] = task
+        task.add_done_callback(_observe_report_job)
+    return await asyncio.shield(task)
+
+
+async def stop_report_workers() -> None:
+    jobs = list(_pdf_jobs.values())
+    for task in jobs:
+        task.cancel()
+    await asyncio.gather(*jobs, return_exceptions=True)
+    _pdf_cache.clear()

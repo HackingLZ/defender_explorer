@@ -2,7 +2,8 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import text
+from sqlalchemy import text, event
+from sqlalchemy.orm import Session
 from .config import get_settings
 
 settings = get_settings()
@@ -20,6 +21,15 @@ async_session_maker = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
+
+
+@event.listens_for(Session, "after_begin")
+def set_history_version(session, transaction, connection):
+    """Apply import provenance to each committed batch without leaking pool state."""
+    version_hash = session.info.get("vdm_version_hash")
+    if version_hash:
+        connection.execute(text("SELECT set_config('app.vdm_version_hash', :version_hash, true)"),
+                           {"version_hash": version_hash})
 
 
 class Base(DeclarativeBase):
@@ -103,6 +113,12 @@ async def init_db():
                     COALESCE(category, '') || ' ' ||
                     COALESCE(family, '')
                 )
+                WHERE search_vector IS NULL
             """))
     except Exception as e:
         print(f"Migration note: {e}")
+
+    # Tracking must install successfully; otherwise do not claim that activity is tracked.
+    from .services.history_migrations import install_history_tracking
+    async with engine.begin() as conn:
+        await install_history_tracking(conn)

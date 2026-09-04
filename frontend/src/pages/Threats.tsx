@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 import {
@@ -20,7 +20,9 @@ import {
   getThreats,
   searchThreats,
   getCategories,
-  getFamilies,
+  getStats,
+  browseFamilies,
+  getActivity,
 } from '../api/client'
 import SearchInput from '../components/SearchInput'
 import Pagination from '../components/Pagination'
@@ -31,44 +33,65 @@ import TimelineHeatmap from '../components/TimelineHeatmap'
 
 export default function Threats() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const initialQuery = searchParams.get('q') || ''
+  const searchQuery = searchParams.get('q') || ''
   const parsedPage = parseInt(searchParams.get('page') || '1', 10)
-  const initialPage = isNaN(parsedPage) || parsedPage < 1 ? 1 : parsedPage
-  const initialCategory = searchParams.get('category') || ''
-  const initialFamily = searchParams.get('family') || ''
-
-  const [searchQuery, setSearchQuery] = useState(initialQuery)
-  const [page, setPage] = useState(initialPage)
-  const [selectedCategory, setSelectedCategory] = useState(initialCategory)
-  const [selectedFamily, setSelectedFamily] = useState(initialFamily)
+  const page = isNaN(parsedPage) || parsedPage < 1 ? 1 : parsedPage
+  const selectedCategory = searchParams.get('category') || ''
+  const selectedFamily = searchParams.get('family') || ''
+  const filtersParam = searchParams.get('filters') || ''
+  const appliedFilters = useMemo<SearchFilter[]>(() => {
+    try {
+      const parsed: unknown = JSON.parse(filtersParam || '[]')
+      return Array.isArray(parsed) ? parsed.filter((f): f is SearchFilter =>
+        !!f && typeof f.field === 'string' && typeof f.operator === 'string' && typeof f.value === 'string'
+      ).slice(0, 20) : []
+    } catch { return [] }
+  }, [filtersParam])
+  const [draftQuery, setDraftQuery] = useState(searchQuery)
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
-    initialCategory ? new Set([initialCategory]) : new Set()
+    selectedCategory ? new Set([selectedCategory]) : new Set()
   )
-  const [showAdvancedSearch, setShowAdvancedSearch] = useState(false)
+  const [showAdvancedSearch, setShowAdvancedSearch] = useState(appliedFilters.length > 0)
   const [showHeatmap, setShowHeatmap] = useState(false)
   const [showMobileSidebar, setShowMobileSidebar] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
-  const [advancedFilters, setAdvancedFilters] = useState<SearchFilter[]>([])
+  const [advancedFilters, setAdvancedFilters] = useState<SearchFilter[]>(appliedFilters)
+  const [familyQuery, setFamilyQuery] = useState('')
+  const [familyPage, setFamilyPage] = useState(1)
+  const [selectedDate, setSelectedDate] = useState<string | null>(null)
+
+  useEffect(() => { setDraftQuery(searchQuery) }, [searchQuery])
+  useEffect(() => { setAdvancedFilters(appliedFilters) }, [appliedFilters])
+  useEffect(() => {
+    setExpandedCategories(selectedCategory ? new Set([selectedCategory]) : new Set())
+    setFamilyPage(1)
+    setFamilyQuery('')
+  }, [selectedCategory])
 
   // Fetch categories
-  const { data: categoriesData, isLoading: categoriesLoading } = useQuery({
+  const { data: statsData } = useQuery({
+    queryKey: ['stats'],
+    queryFn: getStats,
+    staleTime: 60000,
+  })
+  const { data: categoriesData, isLoading: categoriesLoading, isError: categoriesError, refetch: retryCategories } = useQuery({
     queryKey: ['categories'],
     queryFn: () => getCategories(),
   })
 
   // Fetch families for expanded categories
-  const { data: familiesData } = useQuery({
-    queryKey: ['families', selectedCategory],
-    queryFn: () => getFamilies(selectedCategory || undefined),
+  const { data: familiesData, isLoading: familiesLoading, isError: familiesError, refetch: retryFamilies } = useQuery({
+    queryKey: ['families', selectedCategory, familyQuery, familyPage],
+    queryFn: () => browseFamilies({ category: selectedCategory || undefined, q: familyQuery, page: familyPage, page_size: 25 }),
     enabled: !!selectedCategory,
   })
 
   // Fetch threats
-  const { data, isLoading } = useQuery({
-    queryKey: ['threats', searchQuery, page, selectedCategory, selectedFamily],
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['threats', searchQuery, page, selectedCategory, selectedFamily, appliedFilters],
     queryFn: () =>
-      searchQuery
-        ? searchThreats({ q: searchQuery, page, page_size: 50 })
+      searchQuery || appliedFilters.length
+        ? searchThreats({ q: searchQuery, filters: JSON.stringify(appliedFilters), category: selectedCategory || undefined, family: selectedFamily || undefined, page, page_size: 50 })
         : getThreats({
             page,
             page_size: 50,
@@ -78,79 +101,48 @@ export default function Threats() {
   })
 
   const handleSearch = () => {
-    setPage(1)
-    setSelectedCategory('')
-    setSelectedFamily('')
-    setExpandedCategories(new Set())
-    setSearchParams({
-      ...(searchQuery && { q: searchQuery }),
-    })
+    const params = new URLSearchParams(searchParams)
+    params.delete('page')
+    if (draftQuery.trim()) params.set('q', draftQuery.trim())
+    else params.delete('q')
+    setSearchParams(params)
   }
 
   const handlePageChange = (newPage: number) => {
-    setPage(newPage)
-    setSearchParams({
-      ...(searchQuery && { q: searchQuery }),
-      ...(selectedCategory && { category: selectedCategory }),
-      ...(selectedFamily && { family: selectedFamily }),
-      page: newPage.toString(),
-    })
+    const params = new URLSearchParams(searchParams)
+    params.set('page', newPage.toString())
+    setSearchParams(params)
   }
 
   const toggleCategory = (category: string) => {
-    const newExpanded = new Set(expandedCategories)
-    if (newExpanded.has(category)) {
-      newExpanded.delete(category)
-      if (selectedCategory === category) {
-        setSelectedCategory('')
-        setSelectedFamily('')
-        setSearchParams({})
-      }
-    } else {
-      newExpanded.add(category)
-      setSelectedCategory(category)
-      setSelectedFamily('')
-      setPage(1)
-      setSearchQuery('')
-      setSearchParams({ category })
-    }
-    setExpandedCategories(newExpanded)
+    const params = new URLSearchParams(searchParams)
+    params.delete('page')
+    params.delete('family')
+    if (selectedCategory === category) params.delete('category')
+    else params.set('category', category)
+    setSearchParams(params)
   }
 
   const selectFamily = (family: string) => {
-    setSelectedFamily(family)
-    setPage(1)
-    setSearchQuery('')
-    setSearchParams({
-      category: selectedCategory,
-      family,
-    })
+    const params = new URLSearchParams(searchParams)
+    params.delete('page')
+    params.set('family', family)
+    setSearchParams(params)
   }
 
   const clearSelection = () => {
-    setSelectedCategory('')
-    setSelectedFamily('')
     setExpandedCategories(new Set())
-    setSearchQuery('')
-    setPage(1)
+    setDraftQuery('')
+    setAdvancedFilters([])
     setSearchParams({})
   }
 
   const threats = data?.data
   const categories = categoriesData?.data || []
-  const families = familiesData?.data || []
-
-  // Placeholder heatmap data — no real timeline API exists yet
-  const heatmapData = useMemo(() => {
-    const data: { date: string; count: number }[] = []
-    const today = new Date()
-    for (let i = 364; i >= 0; i--) {
-      const date = new Date(today)
-      date.setDate(date.getDate() - i)
-      data.push({ date: date.toISOString().split('T')[0], count: 0 })
-    }
-    return data
-  }, [])
+  const families = familiesData?.data.items || []
+  const { data: activityData, isLoading: activityLoading, isError: activityError, refetch: retryActivity } = useQuery({
+    queryKey: ['activity'], queryFn: getActivity, enabled: showHeatmap,
+  })
 
   // Toggle selection for bulk export
   const toggleSelection = (id: number) => {
@@ -179,22 +171,14 @@ export default function Threats() {
   }
 
   const handleAdvancedSearch = () => {
-    // Build query from filters
-    const searchParts: string[] = []
-    advancedFilters.forEach(f => {
-      if (f.field === 'threat_name' && f.value) {
-        searchParts.push(f.value)
-      }
-    })
-    const newQuery = searchParts.join(' ')
-    setSearchQuery(newQuery)
-    setPage(1)
-    setSelectedCategory('')
-    setSelectedFamily('')
-    setExpandedCategories(new Set())
-    setSearchParams({
-      ...(newQuery && { q: newQuery }),
-    })
+    const params = new URLSearchParams(searchParams)
+    params.delete('page')
+    if (draftQuery.trim()) params.set('q', draftQuery.trim())
+    else params.delete('q')
+    const filters = advancedFilters.filter(f => f.value.trim())
+    if (filters.length) params.set('filters', JSON.stringify(filters))
+    else params.delete('filters')
+    setSearchParams(params)
   }
 
   // Build breadcrumb
@@ -242,6 +226,8 @@ export default function Threats() {
               <div className="p-4">
                 <LoadingSpinner />
               </div>
+            ) : categoriesError ? (
+              <button onClick={() => retryCategories()} className="p-4 text-sm text-red-400">Categories unavailable. Retry</button>
             ) : (
               <div className="py-1">
                 {/* Root - All Threats */}
@@ -256,7 +242,7 @@ export default function Threats() {
                   <FolderOpen className="h-4 w-4 flex-shrink-0" />
                   <span className="truncate">All Threats</span>
                   <span className="ml-auto text-xs text-text-muted">
-                    {categories.reduce((sum, c) => sum + c.count, 0).toLocaleString()}
+                    {statsData?.data.threat_count.toLocaleString() ?? '—'}
                   </span>
                 </button>
 
@@ -291,12 +277,23 @@ export default function Threats() {
                     {expandedCategories.has(cat.category) &&
                       selectedCategory === cat.category && (
                         <div className="bg-bg-deep">
-                          {families.length === 0 ? (
+                          <input
+                            aria-label="Search families"
+                            placeholder="Find a family..."
+                            value={familyQuery}
+                            onChange={e => { setFamilyQuery(e.target.value); setFamilyPage(1) }}
+                            className="m-2 p-2 w-[calc(100%-1rem)] bg-bg-elevated border border-border-dim text-sm"
+                          />
+                          {familiesLoading ? (
                             <div className="pl-10 pr-4 py-2 text-xs text-text-muted">
                               Loading families...
                             </div>
+                          ) : familiesError ? (
+                            <button onClick={() => retryFamilies()} className="p-3 text-sm text-red-400">Families unavailable. Retry</button>
+                          ) : families.length === 0 ? (
+                            <p className="p-3 text-xs text-text-muted">No matching families</p>
                           ) : (
-                            families.slice(0, 50).map((fam) => (
+                            families.map((fam) => (
                               <button
                                 key={fam.family}
                                 onClick={() => selectFamily(fam.family)}
@@ -314,9 +311,11 @@ export default function Threats() {
                               </button>
                             ))
                           )}
-                          {families.length > 50 && (
-                            <div className="pl-10 pr-4 py-2 text-xs text-text-muted italic">
-                              +{families.length - 50} more families
+                          {familiesData && familiesData.data.pages > 1 && (
+                            <div className="p-2 flex items-center justify-between gap-2 text-xs text-text-muted">
+                              <button disabled={familyPage <= 1} onClick={() => setFamilyPage(familyPage - 1)} className="disabled:opacity-40">Previous</button>
+                              <span>{familyPage} / {familiesData.data.pages}</span>
+                              <button disabled={familyPage >= familiesData.data.pages} onClick={() => setFamilyPage(familyPage + 1)} className="disabled:opacity-40">Next</button>
                             </div>
                           )}
                         </div>
@@ -364,13 +363,17 @@ export default function Threats() {
         {/* Timeline Heatmap */}
         {showHeatmap && (
           <div className="mb-6">
-            <TimelineHeatmap
-              data={heatmapData}
-              title="Threat Activity"
-              onDateClick={(date) => {
-                console.log('Selected date:', date)
-              }}
-            />
+            {activityLoading ? <LoadingSpinner /> : activityError ? (
+              <button onClick={() => retryActivity()} className="text-red-400 text-sm">Activity unavailable. Retry</button>
+            ) : !activityData?.data.tracked_since ? (
+              <p className="p-4 border border-border-visible text-text-muted">Change history has not been recorded yet. Activity will appear after tracked imports.</p>
+            ) : (
+              <>
+                <p className="mb-2 text-xs text-text-muted">Recorded definition changes since {new Date(activityData.data.tracked_since).toLocaleDateString()}. Earlier activity is unknown.</p>
+                <TimelineHeatmap data={activityData.data.items} trackedSince={activityData.data.tracked_since} title="Recorded Definition Changes" onDateClick={setSelectedDate} />
+                {selectedDate && <p className="mt-2 text-sm text-text-dim">{selectedDate}: {activityData.data.items.find(item => item.date === selectedDate)?.count ?? 0} recorded changes</p>}
+              </>
+            )}
           </div>
         )}
 
@@ -380,8 +383,8 @@ export default function Threats() {
             <Search className="h-4 w-4 text-text-muted" />
             <div className="flex-1">
               <SearchInput
-                value={searchQuery}
-                onChange={setSearchQuery}
+                value={draftQuery}
+                onChange={setDraftQuery}
                 placeholder="Search threats by name..."
                 onSubmit={handleSearch}
               />
@@ -413,7 +416,7 @@ export default function Threats() {
           </div>
           {searchQuery && (
             <div className="mt-2 text-xs text-text-muted">
-              Searching across all categories
+              {selectedCategory ? `Searching within ${selectedCategory}` : 'Searching across all categories'}
             </div>
           )}
         </div>
@@ -422,8 +425,8 @@ export default function Threats() {
         {showAdvancedSearch && (
           <div className="mb-6">
             <AdvancedSearch
-              query={searchQuery}
-              onQueryChange={setSearchQuery}
+              query={draftQuery}
+              onQueryChange={setDraftQuery}
               filters={advancedFilters}
               onFiltersChange={setAdvancedFilters}
               onSearch={handleAdvancedSearch}
@@ -436,6 +439,11 @@ export default function Threats() {
         {/* Results */}
         {isLoading ? (
           <LoadingSpinner />
+        ) : isError ? (
+          <div role="alert" className="p-6 border border-red-500/30 text-red-400">
+            <p>Unable to load threats. Check your filters and try again.</p>
+            <button onClick={() => refetch()} className="mt-3 underline">Retry</button>
+          </div>
         ) : (
           <>
             <div className="bg-bg-surface border border-border-visible">
@@ -457,6 +465,7 @@ export default function Threats() {
                     {searchQuery && ` matching "${searchQuery}"`}
                     {selectedIds.size > 0 && ` (${selectedIds.size} selected)`}
                   </p>
+                  {selectedIds.size > 0 && <button onClick={() => setSelectedIds(new Set())} className="text-xs text-amber">Clear selection</button>}
                 </div>
                 <BulkExport
                   threats={threats?.items || []}

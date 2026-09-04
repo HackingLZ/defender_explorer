@@ -2,22 +2,22 @@
 
 import asyncio
 import hmac
+import json
 import multiprocessing
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Form, Header, Request
-from pydantic import BaseModel
-from slowapi import Limiter
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, true
+from sqlalchemy.orm import aliased
 
 from ..database import get_db
 from ..config import get_settings
 from ..models import Threat, Signature
-from ..rate_limit import client_key
+from ..rate_limit import limiter as _limiter
 from ..services.yara_service import get_available_rules
 
 router = APIRouter()
-_limiter = Limiter(key_func=client_key)
 _settings = get_settings()
 
 
@@ -131,8 +131,8 @@ async def get_yara_rule_for_threat(
 
 
 class BuildCombinedRequest(BaseModel):
-    threat_ids: list[int]
-    rule_name: str = "combined_detection"
+    threat_ids: list[int] = Field(min_length=1, max_length=500)
+    rule_name: str = Field(default="combined_detection", min_length=1, max_length=128)
 
 
 @router.post("/build")
@@ -170,16 +170,22 @@ async def build_combined_yara_rule(
 
     if not threats:
         raise HTTPException(status_code=404, detail="No threats found")
+    if len(threats) != len(set(threat_ids)):
+        raise HTTPException(status_code=409, detail="Some selected threats no longer exist. Refresh your selection and retry.")
 
     # Build a map of threat.id -> threat for quick lookup
     threat_by_id = {t.id: t for t in threats}
 
     # Fetch at most 20 signatures per threat in a single query, then group in Python
+    sample = (
+        select(Signature).where(Signature.threat_id == Threat.id)
+        .order_by(Signature.id).limit(20).correlate(Threat).lateral()
+    )
+    sampled_signature = aliased(Signature, sample)
     sigs_result = await db.execute(
-        select(Signature)
-        .where(Signature.threat_id.in_(list(threat_by_id.keys())))
-        .order_by(Signature.threat_id, Signature.id)
-        .limit(20 * len(threats))
+        select(sampled_signature).select_from(Threat).join(sample, true())
+        .where(Threat.id.in_(list(threat_by_id.keys())))
+        .order_by(Threat.id, sampled_signature.id)
     )
     all_sigs = sigs_result.scalars().all()
 
@@ -227,20 +233,20 @@ async def build_combined_yara_rule(
                     s = sig.data.decode('utf-8', errors='replace').strip('\x00')
                     if len(s) < 4:
                         continue
-                    s = s.replace('\\', '\\\\').replace('"', '\\"')
+                    s = json.dumps(s, ensure_ascii=True)[1:-1]
                     if data_hash not in string_patterns:
                         string_patterns[data_hash] = (s, sig.sig_type_name, [])
-                    string_patterns[data_hash][2].append(threat.threat_name)
+                    string_patterns[data_hash][2].append(threat.signature_id)
                 except Exception:
                     hex_pattern = " ".join(f"{b:02X}" for b in sig.data[:64])
                     if data_hash not in binary_patterns:
                         binary_patterns[data_hash] = (hex_pattern, [])
-                    binary_patterns[data_hash][1].append(threat.threat_name)
+                    binary_patterns[data_hash][1].append(threat.signature_id)
             else:
                 hex_pattern = " ".join(f"{b:02X}" for b in sig.data[:64])
                 if data_hash not in binary_patterns:
                     binary_patterns[data_hash] = (hex_pattern, [])
-                binary_patterns[data_hash][1].append(threat.threat_name)
+                binary_patterns[data_hash][1].append(threat.signature_id)
 
     # Build YARA rule
     lines = []
@@ -249,32 +255,35 @@ async def build_combined_yara_rule(
     lines.append(f'        description = "Combined detection for {len(threats)} threats"')
     lines.append(f'        threat_count = {len(threats)}')
     if categories:
-        lines.append(f'        categories = "{", ".join(sorted(categories))}"')
+        lines.append(f'        categories = {json.dumps(", ".join(sorted(categories)), ensure_ascii=True)}')
     if families:
-        lines.append(f'        families = "{", ".join(sorted(list(families)[:10]))}"')
+        lines.append(f'        families = {json.dumps(", ".join(sorted(families)[:10]), ensure_ascii=True)}')
     lines.append(f'        generated_by = "Defender Explorer YARA Builder"')
     lines.append("")
     lines.append("    strings:")
 
-    pattern_count = 0
-    max_patterns = 500  # YARA can handle up to ~10000 strings
-
-    # Add string patterns
-    for i, (data_hash, (pattern, sig_type, sources)) in enumerate(list(string_patterns.items())[:max_patterns // 2]):
-        var_name = f"str_{i}"
-        lines.append(f'        ${var_name} = "{pattern}" nocase')
-        pattern_to_threats[var_name] = list(set(sources))  # Dedupe threat names
-        pattern_count += 1
-
-    # Add binary patterns
-    for i, (data_hash, (pattern, sources)) in enumerate(list(binary_patterns.items())[:max_patterns - pattern_count]):
-        var_name = f"bin_{i}"
-        lines.append(f"        ${var_name} = {{ {pattern} }}")
-        pattern_to_threats[var_name] = list(set(sources))  # Dedupe threat names
-        pattern_count += 1
-
-    if pattern_count == 0:
-        lines.append('        $empty = "NO_PATTERNS_FOUND"')
+    max_patterns = 500
+    candidates = [("str", pattern, sources) for pattern, _, sources in string_patterns.values()]
+    candidates += [("bin", pattern, sources) for pattern, sources in binary_patterns.values()]
+    first_for_threat = {}
+    for index, (_, _, sources) in enumerate(candidates):
+        for source in sources:
+            first_for_threat.setdefault(source, index)
+    if any(t.signature_id not in first_for_threat for t in threats):
+        raise HTTPException(status_code=422, detail="A selected threat has no usable patterns in its signature sample. Remove it and retry.")
+    # Reserve representation for every selection before filling the output cap.
+    selected = list(dict.fromkeys(first_for_threat[t.signature_id] for t in threats))
+    selected_set = set(selected)
+    selected.extend(i for i in range(len(candidates)) if i not in selected_set)
+    selected = selected[:max_patterns]
+    names = {t.signature_id: t.threat_name for t in threats}
+    for i, index in enumerate(selected):
+        kind, pattern, sources = candidates[index]
+        var_name = f"{kind}_{i}"
+        value = f'"{pattern}" nocase' if kind == "str" else f"{{ {pattern} }}"
+        lines.append(f"        ${var_name} = {value}")
+        pattern_to_threats[var_name] = sorted({names[source] for source in sources})
+    pattern_count = len(selected)
 
     lines.append("")
     lines.append("    condition:")
@@ -282,6 +291,8 @@ async def build_combined_yara_rule(
     lines.append("}")
 
     yara_rule = "\n".join(lines)
+    if len(yara_rule.encode()) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Generated rule exceeds 2 MiB. Select fewer threats.")
 
     return {
         "rule_name": rule_name,

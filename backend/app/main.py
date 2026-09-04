@@ -5,23 +5,23 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import select, func, update
 
 from .api import router as api_router
 from .config import get_settings
 from .database import init_db
-from .rate_limit import client_key
+from .rate_limit import limiter, RateLimitMiddleware
 from .services.import_service import import_asr_rules
 from .services.decompilation_service import start_background_worker, stop_background_worker
 from .services.sync_service import run_sync
 from .services.scheduler_service import start_scheduler_on_startup
+from .services.report_service import stop_report_workers
 from .database import async_session_maker
 from .models import Threat, SyncStatus, VDMVersion
 
@@ -103,6 +103,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    await stop_report_workers()
     await stop_background_worker()
     print("Stopped background Lua decompilation worker")
 
@@ -117,10 +118,9 @@ app = FastAPI(
 )
 
 # Rate limiting
-limiter = Limiter(key_func=client_key, default_limits=["120/minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 # Configure CORS with configurable origins
 app.add_middleware(
@@ -172,7 +172,6 @@ if static_dir.exists():
         """Serve static files or index.html for SPA routing."""
         # Don't serve for API routes
         if full_path.startswith("api/"):
-            from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Not found")
 
         file_path = (static_dir / full_path).resolve()

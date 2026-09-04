@@ -1,39 +1,68 @@
 """Shared rate-limiting utilities."""
 
 import ipaddress
+import os
 
 from fastapi import Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.routing import Match
 
-# CIDRs that are allowed to set X-Real-IP (our nginx on Docker bridge).
-# Anything outside these ranges has its X-Real-IP header ignored.
-_TRUSTED_PROXIES = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-]
+def _proxy_addresses(value: str) -> frozenset:
+    """Only individual addresses are accepted; a private subnet is not a proxy."""
+    return frozenset(ipaddress.ip_address(part.strip()) for part in value.split(",") if part.strip())
+
+
+_TRUSTED_PROXIES = _proxy_addresses(os.getenv("TRUSTED_PROXY_IPS", ""))
 
 
 def _is_trusted_proxy(ip_str: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip_str)
-        return any(addr in net for net in _TRUSTED_PROXIES)
+        return addr in _TRUSTED_PROXIES
     except ValueError:
         return False
 
 
 def client_key(request: Request) -> str:
-    """Extract the real client IP for rate limiting behind nginx + Cloudflare.
-
-    Only trusts X-Real-IP when the direct TCP connection originates from a
-    known proxy CIDR (Docker bridge / localhost).  If someone connects
-    directly (bypassing nginx), their forged X-Real-IP is ignored and the
-    raw socket IP is used instead.
-    """
+    """Trust valid forwarded addresses only from an explicitly listed proxy."""
     direct_ip = get_remote_address(request)
     if _is_trusted_proxy(direct_ip):
         real_ip = request.headers.get("x-real-ip")
         if real_ip:
-            return real_ip.strip()
+            try:
+                return str(ipaddress.ip_address(real_ip.strip()))
+            except ValueError:
+                pass
     return direct_ip
+
+
+limiter = Limiter(
+    key_func=client_key,
+    key_style="endpoint",
+    default_limits=["120/minute"],
+    application_limits=["120/minute"],
+)
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Apply the aggregate budget even to routes with their own decorators.
+
+    The stock middleware skips decorated routes. Middleware-mode checks apply
+    application limits, leaving decorated limits to the endpoint wrapper.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        handler = None
+        for route in request.app.routes:
+            match, _ = route.matches(request.scope)
+            if match == Match.FULL:
+                handler = getattr(route, "endpoint", None)
+                break
+        try:
+            limiter._check_request_limit(request, handler, in_middleware=True)
+        except RateLimitExceeded as exc:
+            return _rate_limit_exceeded_handler(request, exc)
+        return await call_next(request)

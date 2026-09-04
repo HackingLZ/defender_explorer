@@ -7,8 +7,9 @@ Handles:
 """
 
 import asyncio
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import select, update, func
@@ -16,11 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import async_session_maker
 from ..models import LuaScript
+from .process_worker import run_worker
 
 logger = logging.getLogger(__name__)
 
-# Thread pool for CPU-intensive decompilation
-_decompile_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="decompile_worker")
+# Jobs are shared by public requests and the background worker. Each owns its
+# database session and process, so request cancellation cannot abandon results.
+_DECOMPILE_CONCURRENCY = 2
+_DECOMPILE_TIMEOUT = 30
+_DECOMPILE_MAX_BYTES = 8 * 1024 * 1024
+_decompile_jobs: dict[int, asyncio.Task] = {}
 
 # Background task handle
 _background_task: Optional[asyncio.Task] = None
@@ -29,7 +35,7 @@ _shutdown_event: Optional[asyncio.Event] = None
 
 def _decompile_bytecode_sync(bytecode: bytes) -> tuple[Optional[str], str, list[str]]:
     """
-    Synchronously decompile Lua bytecode (runs in thread pool).
+    Synchronously decompile Lua bytecode (runs in a disposable process).
 
     Returns:
         Tuple of (decompiled_source, status, asr_guids)
@@ -46,68 +52,99 @@ def _decompile_bytecode_sync(bytecode: bytes) -> tuple[Optional[str], str, list[
             all_guids = extract_guids_from_source(source)
             asr_guids = [g.lower() for g in all_guids if g and g.lower() in ASR_RULES]
 
-        return source, "completed", asr_guids
+        return source, "completed" if source else "failed", asr_guids
     except Exception as e:
         logger.debug(f"Decompilation failed: {e}")
         return None, "failed", []
 
 
+def _decompile_worker(bytecode: bytes, output_path: str) -> None:
+    result = json.dumps(_decompile_bytecode_sync(bytecode)).encode("utf-8")
+    if len(result) > _DECOMPILE_MAX_BYTES:
+        raise ValueError("Decompiler output exceeds its limit")
+    Path(output_path).write_bytes(result)
+
+
+async def _run_decompilation(script_id: int) -> Optional[str]:
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(select(LuaScript).where(LuaScript.id == script_id))
+            script = result.scalar_one_or_none()
+            if not script:
+                return None
+            if script.decompilation_status != "pending" or not script.bytecode:
+                return script.decompiled_source
+            bytecode = script.bytecode
+            previous_guids = script.asr_guids or []
+
+        # Release the connection while CPU work runs.
+        try:
+            if len(bytecode) > _DECOMPILE_MAX_BYTES:
+                raise ValueError("Decompiler input exceeds its limit")
+            result = await run_worker(
+                _decompile_worker, (bytecode,), timeout=_DECOMPILE_TIMEOUT,
+                max_output=_DECOMPILE_MAX_BYTES,
+            )
+            source, status, asr_guids = json.loads(result)
+            if status == "failed":
+                asr_guids = previous_guids
+        except Exception as exc:
+            logger.warning("Decompilation failed for script %s: %s", script_id, exc)
+            source, status, asr_guids = None, "failed", previous_guids
+
+        async with async_session_maker() as db:
+            # An import may replace the bytecode while this process is running.
+            # Persist only if this is still the same pending input.
+            result = await db.execute(
+                update(LuaScript)
+                .where(
+                    LuaScript.id == script_id,
+                    LuaScript.bytecode == bytecode,
+                    LuaScript.decompilation_status == "pending",
+                )
+                .values(
+                    decompiled_source=source,
+                    decompilation_status=status,
+                    asr_guids=asr_guids,
+                    is_asr_script=bool(asr_guids),
+                )
+                .returning(LuaScript.id)
+            )
+            updated = result.scalar_one_or_none() is not None
+            await db.commit()
+            if updated and (previous_guids or asr_guids):
+                await _update_asr_rule_counts(db, list(set(previous_guids) | set(asr_guids)))
+            return source if updated else None
+    finally:
+        _decompile_jobs.pop(script_id, None)
+
+
+def _observe_decompilation(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        error = task.exception()
+        if error:
+            logger.error("Decompilation job failed: %s", error)
+
+
+def _get_or_start_job(script_id: int) -> Optional[asyncio.Task]:
+    task = _decompile_jobs.get(script_id)
+    if task is None:
+        if (_shutdown_event is not None and _shutdown_event.is_set()) or len(_decompile_jobs) >= _DECOMPILE_CONCURRENCY:
+            return None
+        task = asyncio.create_task(_run_decompilation(script_id))
+        _decompile_jobs[script_id] = task
+        task.add_done_callback(_observe_decompilation)
+    return task
+
+
 async def decompile_on_demand(db: AsyncSession, script_id: int) -> Optional[str]:
+    """Share bounded work; its independent session survives request cancellation.
+
+    ``db`` is retained for caller compatibility and is never passed to the job.
+    At capacity, return pending immediately so browsing stays responsive.
     """
-    Decompile a script on-demand when viewing.
-
-    If already decompiled, returns cached source.
-    If pending, decompiles and caches result.
-
-    Args:
-        db: Database session
-        script_id: LuaScript ID
-
-    Returns:
-        Decompiled source or None if failed
-    """
-    # Get the script
-    result = await db.execute(
-        select(LuaScript).where(LuaScript.id == script_id)
-    )
-    script = result.scalar_one_or_none()
-
-    if not script:
-        return None
-
-    # Already decompiled
-    if script.decompilation_status == "completed" and script.decompiled_source:
-        return script.decompiled_source
-
-    # No bytecode to decompile
-    if not script.bytecode:
-        return script.decompiled_source  # Return whatever we have
-
-    # Decompile in thread pool
-    loop = asyncio.get_running_loop()
-    source, status, asr_guids = await loop.run_in_executor(
-        _decompile_executor, _decompile_bytecode_sync, script.bytecode
-    )
-
-    # Update database
-    is_asr = len(asr_guids) > 0
-    await db.execute(
-        update(LuaScript)
-        .where(LuaScript.id == script_id)
-        .values(
-            decompiled_source=source,
-            decompilation_status=status,
-            asr_guids=asr_guids,
-            is_asr_script=is_asr
-        )
-    )
-    await db.commit()
-
-    # Update ASR rule script counts
-    if asr_guids:
-        await _update_asr_rule_counts(db, asr_guids)
-
-    return source
+    task = _get_or_start_job(script_id)
+    return await asyncio.shield(task) if task is not None else None
 
 
 async def get_decompilation_stats() -> dict:
@@ -167,56 +204,24 @@ async def _decompile_batch(batch_size: int = 10) -> int:
     async with async_session_maker() as db:
         # Get pending scripts, prioritize ASR scripts
         result = await db.execute(
-            select(LuaScript)
+            select(LuaScript.id)
             .where(LuaScript.decompilation_status == "pending")
             .where(LuaScript.bytecode.isnot(None))
             .order_by(LuaScript.is_asr_script.desc())  # ASR first
             .limit(batch_size)
         )
-        scripts = result.scalars().all()
+        script_ids = result.scalars().all()
 
-        if not scripts:
-            return 0
-
-        loop = asyncio.get_running_loop()
-        processed = 0
-
-        all_asr_guids = set()
-
-        for script in scripts:
-            # Decompile in thread pool
-            source, status, asr_guids = await loop.run_in_executor(
-                _decompile_executor, _decompile_bytecode_sync, script.bytecode
-            )
-
-            # Track ASR GUIDs for batch update
-            all_asr_guids.update(asr_guids)
-            is_asr = len(asr_guids) > 0
-
-            # Update database
-            await db.execute(
-                update(LuaScript)
-                .where(LuaScript.id == script.id)
-                .values(
-                    decompiled_source=source,
-                    decompilation_status=status,
-                    asr_guids=asr_guids,
-                    is_asr_script=is_asr
-                )
-            )
+    processed = 0
+    for script_id in script_ids:
+        task = _get_or_start_job(script_id)
+        if task is None and _decompile_jobs:
+            await asyncio.wait(list(_decompile_jobs.values()), return_when=asyncio.FIRST_COMPLETED)
+            task = _get_or_start_job(script_id)
+        if task is not None:
+            await asyncio.shield(task)
             processed += 1
-
-            # Yield control periodically
-            if processed % 5 == 0:
-                await asyncio.sleep(0)
-
-        await db.commit()
-
-        # Update ASR rule script counts
-        if all_asr_guids:
-            await _update_asr_rule_counts(db, list(all_asr_guids))
-
-        return processed
+    return processed
 
 
 async def decompile_all_pending(batch_size: int = 20, max_batches: Optional[int] = None) -> int:
@@ -286,17 +291,16 @@ async def stop_background_worker():
     """Stop the background decompilation worker."""
     global _background_task, _shutdown_event
 
-    if _background_task is None:
-        return
-
     if _shutdown_event is not None:
         _shutdown_event.set()
-    _background_task.cancel()
+    if _background_task is not None:
+        _background_task.cancel()
+        await asyncio.gather(_background_task, return_exceptions=True)
 
-    try:
-        await _background_task
-    except asyncio.CancelledError:
-        pass
+    jobs = list(_decompile_jobs.values())
+    for task in jobs:
+        task.cancel()
+    await asyncio.gather(*jobs, return_exceptions=True)
 
     _background_task = None
     logger.info("Background decompilation worker stopped")

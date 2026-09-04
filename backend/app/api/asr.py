@@ -5,20 +5,18 @@ import logging
 import re
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from fastapi.responses import Response
-from slowapi import Limiter
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, any_, update
 
 from ..database import get_db
 from ..config import get_settings
 from ..models import ASRRule, LuaScript, Threat
-from ..rate_limit import client_key
+from ..rate_limit import limiter as _limiter
 from ..schemas.asr_rule import ASRRuleResponse, ASRRuleDetail, LuaScriptSummary, ExtractedPatternsResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-_limiter = Limiter(key_func=client_key)
 _settings = get_settings()
 
 
@@ -738,27 +736,22 @@ async def get_asr_timeline(
 
     # Add current state info if no history yet
     if not timeline["events"]:
-        timeline["events"] = [{
-            "date": None,
-            "type": "created",
-            "vdm_version": None,
-            "changes": ["Initial import"],
-            "details": None,
-        }]
-        timeline["message"] = "Timeline tracking starts from this point forward"
+        timeline["message"] = "No recorded changes. History before tracking was enabled is unavailable."
 
     return timeline
 
 
 @router.get("/{guid}/report")
+@_limiter.shared_limit("5/minute", scope="pdf-reports")
 async def get_asr_report(
+    request: Request,
     guid: str,
     format: str = Query("html", pattern="^(html|pdf)$"),
     db: AsyncSession = Depends(get_db),
 
 ):
     """Generate a detailed report for an ASR rule."""
-    from ..services.report_service import generate_asr_report_html, generate_pdf_from_html
+    from ..services.report_service import generate_asr_report_html, generate_pdf_from_html, ReportBusyError, ReportTimeoutError
     from ..services.exclusion_analyzer import analyze_all_exclusions, get_related_rules_by_exclusion
 
     # Get the ASR rule
@@ -792,7 +785,11 @@ async def get_asr_report(
 
     if format == "pdf":
         try:
-            pdf_content = generate_pdf_from_html(html)
+            pdf_content = await generate_pdf_from_html(html)
+        except ReportBusyError:
+            raise HTTPException(status_code=503, detail="Report workers are busy. Please retry shortly.")
+        except ReportTimeoutError:
+            raise HTTPException(status_code=504, detail="Report generation exceeded its time limit.")
         except RuntimeError:
             logger.exception("PDF generation failed for ASR rule %s", guid)
             raise HTTPException(status_code=501, detail="PDF generation is not available")

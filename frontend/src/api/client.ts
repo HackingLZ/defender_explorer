@@ -124,7 +124,10 @@ export const getThreats = (params: {
 }) => api.get<PaginatedResponse<Threat>>('/threats', { params })
 
 export const searchThreats = (params: {
-  q: string
+  q?: string
+  filters?: string
+  category?: string
+  family?: string
   page?: number
   page_size?: number
 }) => api.get<PaginatedResponse<Threat>>('/threats/search', { params })
@@ -176,10 +179,27 @@ export const getSingleSignatureYaraUrl = (signatureId: number) =>
 export const getCategories = () =>
   api.get<{ category: string; count: number }[]>('/threats/categories/list')
 
-export const getFamilies = (category?: string) =>
-  api.get<{ family: string; count: number }[]>('/threats/families/list', {
-    params: { category },
+export const browseFamilies = (params: { category?: string; q?: string; page?: number; page_size?: number }) =>
+  api.get<PaginatedResponse<{ family: string; count: number }>>('/threats/families/list', { params })
+
+export const exportThreats = (threatIds: number[], includeSignatures: boolean) =>
+  api.post<{ items: (Threat & { signatures?: unknown[] })[] }>('/threats/export', {
+    threat_ids: threatIds,
+    include_signatures: includeSignatures,
   })
+
+export interface ServiceStatus {
+  status: 'initializing' | 'running' | 'failed' | 'ready'
+  last_sync: string | null
+  current_version: string | null
+  sync_started_at: string | null
+  threats_added: number
+  threats_updated: number
+  threats_removed: number
+}
+
+export const getServiceStatus = () => api.get<ServiceStatus>('/status')
+export const getActivity = () => api.get<{ items: { date: string; count: number }[]; tracked_since: string | null }>('/activity', { params: { days: 365 } })
 
 export const getLuaScript = (id: number) => api.get<LuaScript>(`/lua/${id}`)
 

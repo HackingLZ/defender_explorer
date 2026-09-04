@@ -18,6 +18,7 @@ class EntityHistory(Base):
     change_type = Column(String(20), nullable=False)  # 'created', 'updated', 'deleted'
     changed_at = Column(DateTime, default=func.now(), nullable=False)
     vdm_version_id = Column(Integer, ForeignKey("vdm_versions.id"), nullable=True)
+    vdm_version_hash = Column(String(64), nullable=True)
     previous_data = Column(JSONB, default={})  # Snapshot before change
     current_data = Column(JSONB, default={})  # Snapshot after change
     diff_summary = Column(Text)  # Human-readable summary of changes

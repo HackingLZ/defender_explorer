@@ -4,7 +4,6 @@ import asyncio
 import hmac
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
-from slowapi import Limiter
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -12,12 +11,11 @@ from sqlalchemy.orm import selectinload
 from ..config import get_settings
 from ..database import get_db
 from ..models import LuaScript, Threat
-from ..rate_limit import client_key
+from ..rate_limit import limiter as _limiter
 from ..schemas.lua_script import LuaScriptResponse, LuaScriptDetail
 from ..schemas.common import PaginatedResponse
 
 router = APIRouter()
-_limiter = Limiter(key_func=client_key)
 _settings = get_settings()
 
 

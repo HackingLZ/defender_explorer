@@ -8,14 +8,13 @@ from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Request
 from pydantic import BaseModel
-from slowapi import Limiter
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update
 
 from ..database import get_db
 from ..config import get_settings
 from ..models import Threat, Signature, LuaScript, ASRRule, VDMVersion, SyncStatus, FunctionDefinition
-from ..rate_limit import client_key
+from ..rate_limit import limiter as _limiter
 from ..schemas.common import StatsResponse, SyncStatusResponse
 from ..services.sync_service import run_sync, run_local_import
 from ..services.extracted_import_service import import_extracted_data
@@ -24,7 +23,6 @@ from ..services.scheduler_service import get_schedule_status, set_schedule
 
 logger = logging.getLogger(__name__)
 
-_limiter = Limiter(key_func=client_key)
 settings = get_settings()
 
 

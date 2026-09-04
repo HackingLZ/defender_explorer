@@ -103,8 +103,8 @@ async def record_history(
     )
 
     db.add(history)
-    await db.commit()
-    await db.refresh(history)
+    # History participates in its caller's transaction, including rollback.
+    await db.flush()
 
     return history
 
@@ -154,9 +154,9 @@ async def get_entity_timeline(
     # Build timeline events
     events = []
     for entry in history_entries:
-        vdm_version = None
+        vdm_version = entry.vdm_version_hash
         if entry.vdm_version_id:
-            vdm_version = vdm_versions.get(entry.vdm_version_id)
+            vdm_version = vdm_versions.get(entry.vdm_version_id) or vdm_version
 
         # Parse changes from diff
         changes = []

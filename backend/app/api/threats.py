@@ -5,21 +5,20 @@ import re
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
-from slowapi import Limiter
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, text
 from sqlalchemy.orm import selectinload
 
 from ..database import get_db
 from ..models import Threat, Signature
-from ..rate_limit import client_key
+from ..rate_limit import limiter as _limiter
+from ..services.explorer_service import ExportRequest, export_threats, parse_filters, threat_predicates
 from ..schemas.threat import ThreatResponse, ThreatDetail, ThreatList, SignatureSummary, LuaScriptSummary
 from ..config import get_settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-_limiter = Limiter(key_func=client_key)
 settings = get_settings()
 
 # Some threats have millions of signatures (e.g. InfrastructureShared has 426k+).
@@ -147,36 +146,24 @@ async def list_threats(
 
 @router.get("/search", response_model=ThreatList)
 async def search_threats(
-    q: str = Query(..., min_length=1),
+    q: str = Query("", max_length=255),
+    filters: Optional[str] = Query(None, max_length=20000),
+    category: Optional[str] = Query(None, max_length=100),
+    family: Optional[str] = Query(None, max_length=100),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 
 ):
     """Full-text search for threats."""
-    # Use ILIKE with trigram index for fast fuzzy matching
-    search_pattern = f"%{_escape_like(q)}%"
-
-    # Also match numeric signature_id if the query looks like a number
-    sig_id_filter = None
-    stripped = q.strip()
-    if stripped.isdigit():
-        sig_id_filter = Threat.signature_id == int(stripped)
-    elif stripped.lower().startswith("0x"):
-        try:
-            sig_id_filter = Threat.signature_id == int(stripped, 16)
-        except ValueError:
-            pass
-
-    name_filter = Threat.threat_name.ilike(search_pattern)
-    where_clause = or_(name_filter, sig_id_filter) if sig_id_filter is not None else name_filter
+    predicates = threat_predicates(q, category, family, parse_filters(filters))
 
     # Get results first (fast with GIN index)
     offset = (page - 1) * page_size
     query = (
         select(Threat)
-        .where(where_clause)
-        .order_by(Threat.threat_name)
+        .where(*predicates)
+        .order_by(Threat.threat_name, Threat.id)
         .offset(offset)
         .limit(page_size)
     )
@@ -189,7 +176,7 @@ async def search_threats(
         total = len(threats)
     else:
         # Use faster count with same index
-        count_query = select(func.count(Threat.id)).where(where_clause)
+        count_query = select(func.count(Threat.id)).where(*predicates)
         total = (await db.execute(count_query)).scalar()
 
     pages = (total + page_size - 1) // page_size if total else 0
@@ -201,6 +188,13 @@ async def search_threats(
         page_size=page_size,
         pages=pages,
     )
+
+
+@router.post("/export")
+@_limiter.limit("5/minute")
+async def export_selected_threats(request: Request, body: ExportRequest, db: AsyncSession = Depends(get_db)):
+    """Export every selected threat, rejecting oversized exports instead of truncating."""
+    return await export_threats(db, body)
 
 
 @router.get("/{sig_id}", response_model=ThreatDetail)
@@ -284,6 +278,9 @@ async def list_categories(db: AsyncSession = Depends(get_db)):
 @router.get("/families/list")
 async def list_families(
     category: Optional[str] = None,
+    q: str = Query("", max_length=100),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 
 ):
@@ -295,12 +292,18 @@ async def list_families(
     if category:
         query = query.where(Threat.category == category)
 
-    query = query.group_by(Threat.family).order_by(func.count(Threat.id).desc()).limit(100)
+    if q:
+        query = query.where(Threat.family.ilike(f"%{_escape_like(q)}%", escape="\\"))
+    query = query.group_by(Threat.family)
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
+    query = query.order_by(func.count(Threat.id).desc(), Threat.family).offset((page - 1) * page_size).limit(page_size)
 
     result = await db.execute(query)
     families = result.all()
 
-    return [{"family": f, "count": count} for f, count in families]
+    return {"items": [{"family": f, "count": count} for f, count in families],
+            "total": total, "page": page, "page_size": page_size,
+            "pages": (total + page_size - 1) // page_size}
 
 
 @router.get("/{sig_id}/signatures/download")
@@ -620,27 +623,22 @@ async def get_threat_timeline(
 
     # Add current state info if no history yet
     if not timeline["events"]:
-        timeline["events"] = [{
-            "date": threat.created_at.isoformat() if threat.created_at else None,
-            "type": "created",
-            "vdm_version": None,
-            "changes": ["Initial import"],
-            "details": None,
-        }]
-        timeline["message"] = "Timeline tracking starts from this point forward"
+        timeline["message"] = "No recorded changes. History before tracking was enabled is unavailable."
 
     return timeline
 
 
 @router.get("/{sig_id}/report")
+@_limiter.shared_limit("5/minute", scope="pdf-reports")
 async def get_threat_report(
+    request: Request,
     sig_id: int,
     format: str = Query("html", pattern="^(html|pdf)$"),
     db: AsyncSession = Depends(get_db),
 
 ):
     """Generate a detailed report for a threat."""
-    from ..services.report_service import generate_threat_report_html, generate_pdf_from_html
+    from ..services.report_service import generate_threat_report_html, generate_pdf_from_html, ReportBusyError, ReportTimeoutError
 
     # Get threat with lua_scripts (small), signatures loaded separately with cap
     query = (
@@ -729,7 +727,11 @@ async def get_threat_report(
 
     if format == "pdf":
         try:
-            pdf_content = generate_pdf_from_html(html)
+            pdf_content = await generate_pdf_from_html(html)
+        except ReportBusyError:
+            raise HTTPException(status_code=503, detail="Report workers are busy. Please retry shortly.")
+        except ReportTimeoutError:
+            raise HTTPException(status_code=504, detail="Report generation exceeded its time limit.")
         except RuntimeError:
             logger.exception("PDF generation failed for threat %s", sig_id)
             raise HTTPException(status_code=501, detail="PDF generation is not available")

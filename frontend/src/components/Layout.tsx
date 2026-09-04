@@ -79,8 +79,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         {/* Footer */}
         <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-border-dim">
           <div className="flex items-center gap-2 text-xs text-text-muted uppercase tracking-wider">
-            <span className="status-dot" />
-            <span>Systems Operational</span>
+            <span>Defender definition explorer</span>
           </div>
         </div>
       </div>

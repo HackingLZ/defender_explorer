@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, Set, Dict, List, Any
 from dataclasses import dataclass, field
 
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import async_session_maker
@@ -432,6 +432,9 @@ async def _import_vdm_files(db: AsyncSession, sync_id: int, vdm_files: dict) -> 
         return
 
     print("New version, proceeding with import...", flush=True)
+    db.info["vdm_version_hash"] = version_hash
+    await db.execute(text("SELECT set_config('app.vdm_version_hash', :version_hash, true)"),
+                     {"version_hash": version_hash})
 
     # Check if we have existing data and can do incremental sync
     current_version = await db.execute(

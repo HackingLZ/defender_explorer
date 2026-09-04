@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 
 interface TimelineHeatmapProps {
   data: { date: string; count: number }[]
+  trackedSince: string
   title?: string
   onDateClick?: (date: string) => void
 }
@@ -16,44 +17,36 @@ function getIntensity(count: number, max: number): string {
   return 'bg-amber/30'
 }
 
-// Generate calendar grid for the last 12 months
-function generateCalendarGrid(data: { date: string; count: number }[]) {
-  const today = new Date()
+// Zero-fill only the period covered by tracking; earlier history is unknown.
+function generateCalendarGrid(data: { date: string; count: number }[], trackedSince: string) {
   const months: { name: string; days: { date: string; count: number; dayOfMonth: number }[] }[] = []
-
-  // Create a map for quick lookup
-  const dataMap = new Map(data.map(d => [d.date, d.count]))
-
-  // Generate last 12 months
-  for (let monthOffset = 11; monthOffset >= 0; monthOffset--) {
-    const date = new Date(today.getFullYear(), today.getMonth() - monthOffset, 1)
-    const monthName = date.toLocaleDateString('en-US', { month: 'short' })
-    const daysInMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate()
-    const days: { date: string; count: number; dayOfMonth: number }[] = []
-
-    for (let day = 1; day <= daysInMonth; day++) {
-      const dayDate = new Date(date.getFullYear(), date.getMonth(), day)
-      const dateStr = dayDate.toISOString().split('T')[0]
-      days.push({
-        date: dateStr,
-        count: dataMap.get(dateStr) || 0,
-        dayOfMonth: day,
-      })
+  const counts = new Map(data.map(item => [item.date, item.count]))
+  const today = new Date().toISOString().slice(0, 10)
+  const start = new Date(`${today}T00:00:00Z`)
+  start.setUTCDate(start.getUTCDate() - 364)
+  const firstTrackedDate = trackedSince.slice(0, 10)
+  let previousMonth = ''
+  for (const day = new Date(start); day.toISOString().slice(0, 10) <= today; day.setUTCDate(day.getUTCDate() + 1)) {
+    const date = day.toISOString().slice(0, 10)
+    if (date < firstTrackedDate) continue
+    const month = date.slice(0, 7)
+    if (month !== previousMonth) {
+      months.push({ name: day.toLocaleDateString('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' }), days: [] })
+      previousMonth = month
     }
-
-    months.push({ name: monthName, days })
+    months[months.length - 1].days.push({ date, count: counts.get(date) ?? 0, dayOfMonth: day.getUTCDate() })
   }
 
   return months
 }
 
-export default function TimelineHeatmap({ data, title = 'Activity Heatmap', onDateClick }: TimelineHeatmapProps) {
+export default function TimelineHeatmap({ data, trackedSince, title = 'Activity Heatmap', onDateClick }: TimelineHeatmapProps) {
   const { months, maxCount, totalCount } = useMemo(() => {
-    const months = generateCalendarGrid(data)
+    const months = generateCalendarGrid(data, trackedSince)
     const maxCount = Math.max(...data.map(d => d.count), 1)
     const totalCount = data.reduce((sum, d) => sum + d.count, 0)
     return { months, maxCount, totalCount }
-  }, [data])
+  }, [data, trackedSince])
 
   return (
     <div className="bg-bg-surface border border-border-visible p-4 rounded-lg">
@@ -86,6 +79,8 @@ export default function TimelineHeatmap({ data, title = 'Activity Heatmap', onDa
                   <button
                     key={dayIndex}
                     onClick={() => onDateClick?.(day.date)}
+                    disabled={!onDateClick}
+                    aria-label={`${day.date}: ${day.count} recorded changes`}
                     className={`w-3 h-3 rounded-sm ${getIntensity(day.count, maxCount)} hover:ring-1 hover:ring-amber transition-all`}
                     title={`${day.date}: ${day.count} events`}
                   />

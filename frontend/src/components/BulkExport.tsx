@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Download, FileText, Table, FileCode, Loader2, Check, AlertCircle } from 'lucide-react'
-import { api, Threat } from '../api/client'
+import { isAxiosError } from 'axios'
+import { api, exportThreats, Threat } from '../api/client'
 
 export type ExportFormat = 'json' | 'csv' | 'yara'
 
@@ -47,19 +48,13 @@ export default function BulkExport({ threats, selectedIds, onExportStart, onExpo
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
 
-  const threatsToExport = selectedIds && selectedIds.size > 0
-    ? threats.filter(t => selectedIds.has(t.signature_id))
-    : threats
+  const exportIds = selectedIds && selectedIds.size > 0
+    ? Array.from(selectedIds)
+    : threats.map(t => t.signature_id)
 
   const exportJSON = async () => {
-    const data = threatsToExport.map(t => ({
-      signature_id: t.signature_id,
-      threat_name: t.threat_name,
-      category: t.category,
-      family: t.family,
-      signature_count: t.signature_count,
-      created_at: t.created_at,
-    }))
+    const { data: response } = await exportThreats(exportIds, includeSignatures)
+    const data = response.items
 
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     downloadBlob(blob, `threats-export-${Date.now()}.json`)
@@ -67,32 +62,35 @@ export default function BulkExport({ threats, selectedIds, onExportStart, onExpo
 
   const exportCSV = async () => {
     const headers = ['Signature ID', 'Threat Name', 'Category', 'Family', 'Signature Count', 'Created At']
-    const rows = threatsToExport.map(t => [
+    const { data } = await exportThreats(exportIds, false)
+    const csvCell = (value: unknown) => {
+      const text = String(value ?? '')
+      // Treat spreadsheet formulas as text and quote every cell, including newlines.
+      const safe = /^[\s]*[=+@-]/.test(text) ? `'${text}` : text
+      return `"${safe.replace(/"/g, '""')}"`
+    }
+    const rows = data.items.map(t => [
       t.signature_id,
-      `"${t.threat_name.replace(/"/g, '""')}"`,
+      t.threat_name,
       t.category || '',
       t.family || '',
       t.signature_count,
       t.created_at,
     ])
 
-    const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n')
+    const csv = [headers.map(csvCell).join(','), ...rows.map(r => r.map(csvCell).join(','))].join('\r\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     downloadBlob(blob, `threats-export-${Date.now()}.csv`)
   }
 
   const exportYARA = async () => {
-    try {
-      const response = await api.post('/yara/build', {
-        threat_ids: threatsToExport.map(t => t.signature_id),
-        rule_name: `bulk_export_${Date.now()}`,
-      })
+    const response = await api.post('/yara/build', {
+      threat_ids: exportIds,
+      rule_name: `bulk_export_${Date.now()}`,
+    })
 
-      const blob = new Blob([response.data.rule_content], { type: 'text/plain' })
-      downloadBlob(blob, `threats-export-${Date.now()}.yar`)
-    } catch (err) {
-      throw new Error('Failed to generate YARA rules')
-    }
+    const blob = new Blob([response.data.rule_content], { type: 'text/plain' })
+    downloadBlob(blob, `threats-export-${Date.now()}.yar`)
   }
 
   const downloadBlob = (blob: Blob, filename: string) => {
@@ -125,7 +123,8 @@ export default function BulkExport({ threats, selectedIds, onExportStart, onExpo
       setSuccess(true)
       setTimeout(() => setSuccess(false), 3000)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Export failed')
+      const detail = isAxiosError(err) ? err.response?.data?.detail : null
+      setError(typeof detail === 'string' ? detail : err instanceof Error ? err.message : 'Export failed')
     } finally {
       setIsExporting(false)
       onExportComplete?.()
@@ -156,7 +155,8 @@ export default function BulkExport({ threats, selectedIds, onExportStart, onExpo
           <div className="p-4 border-b border-border-dim">
             <h3 className="text-sm font-semibold text-text-bright mb-1">Bulk Export</h3>
             <p className="text-xs text-text-muted">
-              Export {threatsToExport.length} threat{threatsToExport.length !== 1 ? 's' : ''}
+              Export {exportIds.length} threat{exportIds.length !== 1 ? 's' : ''}
+              {selectedIds?.size ? ' selected across pages' : ' on this page'}
             </p>
           </div>
 
@@ -213,6 +213,7 @@ export default function BulkExport({ threats, selectedIds, onExportStart, onExpo
               </div>
             )}
 
+            {exportIds.length > 500 && <p role="alert" className="text-xs text-red-400">Select at most 500 threats per export.</p>}
             {/* Error/Success Messages */}
             {error && (
               <div className="flex items-center gap-2 p-2 bg-red-500/10 border border-red-500/30 rounded text-xs text-red-400">
@@ -230,7 +231,7 @@ export default function BulkExport({ threats, selectedIds, onExportStart, onExpo
             {/* Export Button */}
             <button
               onClick={handleExport}
-              disabled={isExporting || threatsToExport.length === 0}
+              disabled={isExporting || exportIds.length === 0 || exportIds.length > 500}
               className="w-full px-4 py-2 bg-amber text-bg-deep font-medium text-sm hover:bg-amber-bright disabled:opacity-50 flex items-center justify-center gap-2"
             >
               {isExporting ? (

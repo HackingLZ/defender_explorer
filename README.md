@@ -71,14 +71,37 @@ If you have VDM files already, drop them in `./data/vdm/` before starting. The a
 | `VDM_PATH` | No | `./data/vdm` | Host path to VDM files |
 | `EXTRACTED_PATH` | No | `./data/extracted` | Host path to pre-extracted data |
 | `CORS_ORIGINS` | No | localhost only | Comma-separated allowed origins |
+| `TRUSTED_PROXY_IPS` | No | empty | Exact proxy IP addresses trusted to supply `X-Real-IP` |
+
+When using a reverse proxy, set `TRUSTED_PROXY_IPS` to its exact address as seen
+by the app. The proxy must overwrite incoming `X-Real-IP` headers. With no trusted
+proxy configured, requests share the connecting peer's rate limit. Private
+network ranges are not trusted automatically.
+Docker starts Uvicorn with `--no-proxy-headers` so this check uses the actual
+connecting peer. Use the same flag when running Uvicorn directly.
+
+Search supports combined field/operator filters and URL-based navigation. Bulk
+exports include all selected threats across pages; JSON can include signature
+bytes as hexadecimal. Exports exceeding 500 threats, 5,000 included signatures,
+or 16 MiB are rejected with an explanation rather than silently truncated.
+
+Threat and ASR history is recorded transactionally from the first startup of
+this version. Existing rows are not presented as historical events. History
+stores compact metadata and definition fingerprints, not duplicate signature
+payloads; the activity chart counts recorded threat changes by UTC day. Normal
+VDM imports attach the source version hash to their changes.
+
+PDF rendering and Lua decompilation run in bounded worker processes with hard
+deadlines. A busy PDF service returns a retryable error. Public status exposes
+sync progress without administrator diagnostics or credentials.
 
 ## Updating definitions
 
-After initial sync, the app schedules automatic updates. To trigger a manual sync hit the admin endpoint or restart the container with an empty database volume:
+After initial sync, the app schedules automatic updates. To trigger a manual
+sync, export your configured `ADMIN_API_KEY` in the shell and call:
 
 ```bash
-docker compose down -v   # drops the DB volume
-docker compose up -d     # fresh sync on next start
+curl -X POST http://localhost:8000/api/admin/sync -H "X-API-Key: $ADMIN_API_KEY"
 ```
 
 ## Architecture
@@ -99,3 +122,13 @@ The multi-stage Dockerfile builds the frontend, compiles `luadec` from source fo
 | PostgreSQL | 5432 | 127.0.0.1 |
 
 Both are bound to localhost only. Put a reverse proxy (nginx, Caddy) in front for public exposure.
+
+## Regression checks
+
+Install `backend/requirements.txt` into a Python 3.11 environment. Run the worker
+and rate-policy tests with `PYTHONPATH=backend:. python -m unittest discover -s backend/tests -p 'test_security_*.py'`.
+The database tests additionally require `TEST_DATABASE_URL` pointing to a
+**disposable localhost database named `defender_test`**; they clear that test
+database's application tables. Run them with
+`PYTHONPATH=backend:. python -m unittest discover -s backend/tests -p 'test_explorer_integration.py'`.
+Run `npm run build` in `frontend/` for the frontend type check and production build.
