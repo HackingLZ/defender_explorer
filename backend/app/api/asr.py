@@ -753,7 +753,7 @@ async def get_asr_timeline(
 @router.get("/{guid}/report")
 async def get_asr_report(
     guid: str,
-    format: str = Query("html", regex="^(html|pdf)$"),
+    format: str = Query("html", pattern="^(html|pdf)$"),
     db: AsyncSession = Depends(get_db),
 
 ):

@@ -1,0 +1,15 @@
+# Direct application dependencies. Regenerate the hash-locked requirements.txt with:
+# uv pip compile requirements.in --python-version 3.11 --universal --generate-hashes --output-file requirements.txt
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+sqlalchemy[asyncio]==2.0.52
+asyncpg==0.31.0
+pydantic[email]==2.13.5
+pydantic-settings==2.15.0
+python-multipart==0.0.32
+alembic==1.19.1
+httpx==0.28.1
+pefile==2024.8.26
+slowapi==0.1.10
+yara-python==4.5.4
+weasyprint==69.0

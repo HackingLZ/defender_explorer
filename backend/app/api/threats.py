@@ -306,7 +306,7 @@ async def list_families(
 @router.get("/{sig_id}/signatures/download")
 async def download_signatures(
     sig_id: int,
-    format: str = Query("hex", regex="^(hex|raw|c)$"),
+    format: str = Query("hex", pattern="^(hex|raw|c)$"),
     db: AsyncSession = Depends(get_db),
 
 ):
@@ -635,7 +635,7 @@ async def get_threat_timeline(
 @router.get("/{sig_id}/report")
 async def get_threat_report(
     sig_id: int,
-    format: str = Query("html", regex="^(html|pdf)$"),
+    format: str = Query("html", pattern="^(html|pdf)$"),
     db: AsyncSession = Depends(get_db),
 
 ):

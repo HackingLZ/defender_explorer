@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:15-alpine
+    image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
     container_name: defender_explorer_db
     environment:
       TZ: America/New_York
@@ -31,6 +31,8 @@ services:
     tmpfs:
       - /tmp
       - /var/run/postgresql
+    mem_limit: ${DB_MEMORY_LIMIT:-768m}
+    memswap_limit: ${DB_MEMORY_LIMIT:-768m}
 
   app:
     build:
@@ -44,14 +46,14 @@ services:
       EXTRACTED_PATH: /data/extracted
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
     volumes:
       # Mount local VDM files (optional)
       - ${VDM_PATH:-./data/vdm}:/data/vdm:ro
       # Mount pre-extracted data (optional)
       - ${EXTRACTED_PATH:-./data/extracted}:/data/extracted:ro
-    mem_limit: 6g
-    memswap_limit: 6g
+    mem_limit: ${APP_MEMORY_LIMIT:-3g}
+    memswap_limit: ${APP_MEMORY_LIMIT:-3g}
     depends_on:
       db:
         condition: service_healthy

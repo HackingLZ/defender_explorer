@@ -12,7 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 
 from .api import router as api_router
 from .config import get_settings
@@ -23,7 +23,7 @@ from .services.decompilation_service import start_background_worker, stop_backgr
 from .services.sync_service import run_sync
 from .services.scheduler_service import start_scheduler_on_startup
 from .database import async_session_maker
-from .models import Threat, SyncStatus
+from .models import Threat, SyncStatus, VDMVersion
 
 settings = get_settings()
 
@@ -46,13 +46,39 @@ async def lifespan(app: FastAPI):
     start_background_worker()
     print("Started background Lua decompilation worker")
 
-    # Auto-sync on first startup if database is empty
+    # Auto-sync until an initial VDM version has been imported completely.
+    # Threat rows are committed in batches, so their presence alone does not
+    # prove that a previous first-run sync reached its finalization step.
     async with async_session_maker() as db:
         result = await db.execute(select(func.count(Threat.id)))
         threat_count = result.scalar() or 0
 
-        if threat_count == 0:
-            print("No threat data found - starting initial sync automatically...")
+        result = await db.execute(
+            select(func.count(VDMVersion.id)).where(VDMVersion.is_current.is_(True))
+        )
+        current_version_count = result.scalar() or 0
+
+        if threat_count == 0 or current_version_count == 0:
+            if threat_count:
+                print(
+                    f"Found {threat_count} partially imported threats without a "
+                    "completed VDM version - retrying initial sync automatically..."
+                )
+            else:
+                print("No threat data found - starting initial sync automatically...")
+
+            # A process restart can leave its background sync marked as running.
+            # Close those stale records before creating the retry attempt.
+            await db.execute(
+                update(SyncStatus)
+                .where(SyncStatus.status == "running")
+                .values(
+                    status="failed",
+                    completed_at=datetime.utcnow(),
+                    error_message="Sync interrupted before completion; retrying automatically",
+                )
+            )
+
             # Create sync status record
             sync_status = SyncStatus(
                 started_at=datetime.utcnow(),
@@ -66,7 +92,10 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(run_sync(sync_status.id))
             print(f"Initial sync started (sync_id={sync_status.id})")
         else:
-            print(f"Database has {threat_count} threats - skipping auto-sync")
+            print(
+                f"Database has {threat_count} threats and a completed VDM version - "
+                "skipping auto-sync"
+            )
 
     # Restore scheduled sync from DB settings
     await start_scheduler_on_startup()

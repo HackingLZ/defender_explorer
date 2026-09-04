@@ -1,6 +1,7 @@
 """Service for syncing VDM data with delta updates."""
 
 import asyncio
+import gc
 import hashlib
 import logging
 import tempfile
@@ -557,8 +558,12 @@ async def _import_vdm_files(db: AsyncSession, sync_id: int, vdm_files: dict) -> 
             print(f"Processed {vdm_key}: {len(threats)} threats", flush=True)
 
             total_threats += len(threats)
-            for threat_def in threats:
+            for threat_index, threat_def in enumerate(threats):
                 await import_service._import_threat(threat_def, stats)
+                # Signature payloads can be large. Drop the parsed object as soon
+                # as its database write has completed instead of retaining the
+                # entire VDM file for the duration of the import.
+                threats[threat_index] = None
                 processed += 1
                 if processed % batch_size == 0:
                     await asyncio.sleep(0)
@@ -573,9 +578,13 @@ async def _import_vdm_files(db: AsyncSession, sync_id: int, vdm_files: dict) -> 
                             )
                         )
                         await db.commit()
+                        db.sync_session.expunge_all()
                         if total_threats:
                             logger.info(f"Import progress: {processed}/{total_threats} threats ({processed * 100 // total_threats}%)")
                             print(f"Import progress: {processed}/{total_threats} threats ({processed * 100 // total_threats}%)", flush=True)
+
+            del threats
+            gc.collect()
 
         total_threats_added = stats.threats_added
         total_threats_updated = stats.threats_updated

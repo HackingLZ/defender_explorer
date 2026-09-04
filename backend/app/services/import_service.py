@@ -76,6 +76,8 @@ class ImportStats:
 class ImportService:
     """Service for importing VDM data into the database."""
 
+    SIGNATURE_INSERT_BATCH_SIZE = 1000
+
     def __init__(self, db: AsyncSession, decompile_during_import: bool = True):
         self.db = db
         self.decompile_during_import = decompile_during_import
@@ -449,10 +451,10 @@ class ImportService:
                         "extracted_text": extracted_text if extracted_text else None,
                     }
                 )
+                if len(non_lua_batch) >= self.SIGNATURE_INSERT_BATCH_SIZE:
+                    await self._insert_non_lua_signatures(non_lua_batch, stats)
 
-        if non_lua_batch:
-            await self.db.execute(insert(Signature), non_lua_batch)
-            stats.signatures_added += len(non_lua_batch)
+        await self._insert_non_lua_signatures(non_lua_batch, stats)
 
         if lua_entries:
             await self._import_lua_scripts_batch(
@@ -471,6 +473,19 @@ class ImportService:
             h.update(bytes([sig.sig_type]))
             h.update(sig.data or b'')
         return h.hexdigest()
+
+    async def _insert_non_lua_signatures(
+        self,
+        rows: list[dict],
+        stats: ImportStats,
+    ) -> None:
+        """Insert and release a bounded batch of non-Lua signatures."""
+        if not rows:
+            return
+        row_count = len(rows)
+        await self.db.execute(insert(Signature), rows)
+        stats.signatures_added += row_count
+        rows.clear()
 
     async def update_threat(self, sig_id: int, threat_def, stats: ImportStats) -> None:
         """
@@ -563,10 +578,10 @@ class ImportService:
                         "extracted_text": extracted_text if extracted_text else None,
                     }
                 )
+                if len(non_lua_batch) >= self.SIGNATURE_INSERT_BATCH_SIZE:
+                    await self._insert_non_lua_signatures(non_lua_batch, stats)
 
-        if non_lua_batch:
-            await self.db.execute(insert(Signature), non_lua_batch)
-            stats.signatures_added += len(non_lua_batch)
+        await self._insert_non_lua_signatures(non_lua_batch, stats)
 
         if lua_entries:
             await self._import_lua_scripts_batch(

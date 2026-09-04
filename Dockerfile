@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for Defender Explorer
 # Stage 1: Build frontend
-FROM node:20-alpine AS frontend-build
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend-build
 
 WORKDIR /frontend
 COPY frontend/package*.json ./
@@ -10,7 +10,10 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Build luadec from source
-FROM debian:bookworm-slim AS luadec-build
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS luadec-build
+
+ARG LUADEC_COMMIT=895d92313fabaee260121c758c8320d1b21dd741
+ARG LUA51_COMMIT=cdcfa70f2f731409046374e797a62314b4924b77
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -19,17 +22,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build luadec for Lua 5.1
-RUN git clone https://github.com/viruscamp/luadec.git /luadec \
+# Fetch the reviewed luadec revision and its pinned Lua 5.1 submodule.
+RUN git init /luadec \
+    && git -C /luadec remote add origin https://github.com/viruscamp/luadec.git \
+    && git -C /luadec fetch --depth 1 origin "${LUADEC_COMMIT}" \
+    && git -C /luadec checkout --detach FETCH_HEAD \
+    && test "$(git -C /luadec rev-parse HEAD)" = "${LUADEC_COMMIT}" \
+    && git -C /luadec submodule update --init --depth 1 lua-5.1 \
+    && test "$(git -C /luadec/lua-5.1 rev-parse HEAD)" = "${LUA51_COMMIT}" \
     && cd /luadec \
-    && git submodule update --init lua-5.1 \
     && cd lua-5.1 \
     && make linux \
     && cd ../luadec \
     && make LUAVER=5.1
 
 # Stage 3: Python backend with frontend static files
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
 
 WORKDIR /app
 
@@ -53,7 +61,7 @@ RUN chmod +x /usr/local/bin/luadec
 
 # Copy backend requirements and install
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # Copy backend code
 COPY backend/ .
