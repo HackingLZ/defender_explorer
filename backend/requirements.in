@@ -12,4 +12,4 @@ httpx==0.28.1
 pefile==2024.8.26
 slowapi==0.1.10
 yara-python==4.5.4
-weasyprint==69.0
+weasyprint==70.0
