@@ -236,13 +236,14 @@ class ImportServiceV2:
         """
         logger.info(f"Using direct extraction for {vdm_file.name}")
 
+        from .vdm_service import decompress_vdm
+        decompressed = await decompress_vdm(str(vdm_file))
         loop = asyncio.get_event_loop()
 
         def do_extract():
             # Add parent path for imports
             sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
 
-            from defender_sig_extractor.vdm_parser import VDMParser
             from defender_sig_extractor.signature_extractor import extract_threats
             from defender_sig_extractor.output.asr_writer import (
                 extract_lua_from_signature,
@@ -251,9 +252,6 @@ class ImportServiceV2:
             )
             from defender_sig_extractor.signature_types import is_lua_type
 
-            # Parse VDM
-            parser = VDMParser(str(vdm_file))
-            decompressed = parser.decompress()
             threats = list(extract_threats(decompressed))
 
             lua_dir = output_dir / "lua"

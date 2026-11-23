@@ -59,6 +59,8 @@ CREATE INDEX IF NOT EXISTS idx_lua_scripts_asr_guids ON lua_scripts USING GIN(as
 CREATE INDEX IF NOT EXISTS idx_lua_scripts_decompilation_status ON lua_scripts(decompilation_status);
 CREATE INDEX IF NOT EXISTS idx_lua_scripts_is_asr ON lua_scripts(is_asr_script) WHERE is_asr_script = TRUE;
 
+CREATE INDEX IF NOT EXISTS ix_lua_scripts_signature_id ON lua_scripts(signature_id);
+
 -- Hashes
 CREATE TABLE IF NOT EXISTS hashes (
     id SERIAL PRIMARY KEY,

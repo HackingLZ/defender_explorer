@@ -49,74 +49,89 @@ async def get_db() -> AsyncSession:
 async def init_db():
     """Initialize database tables."""
     async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.create_all)
 
     # Run migrations for new columns
-    try:
-        async with engine.begin() as conn:
-            # Ensure required extensions
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    async with engine.begin() as conn:
+        # Ensure search vector trigger/function exists
+        await conn.execute(text("""
+            CREATE OR REPLACE FUNCTION update_threat_search_vector()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.search_vector := to_tsvector('english',
+                    COALESCE(NEW.threat_name, '') || ' ' ||
+                    COALESCE(NEW.category, '') || ' ' ||
+                    COALESCE(NEW.family, '')
+                );
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """))
+        await conn.execute(text("DROP TRIGGER IF EXISTS threat_search_vector_update ON threats"))
+        await conn.execute(text("""
+            CREATE TRIGGER threat_search_vector_update
+            BEFORE INSERT OR UPDATE ON threats
+            FOR EACH ROW
+            EXECUTE FUNCTION update_threat_search_vector()
+        """))
 
-            # Ensure search vector trigger/function exists
-            await conn.execute(text("""
-                CREATE OR REPLACE FUNCTION update_threat_search_vector()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    NEW.search_vector := to_tsvector('english',
-                        COALESCE(NEW.threat_name, '') || ' ' ||
-                        COALESCE(NEW.category, '') || ' ' ||
-                        COALESCE(NEW.family, '')
-                    );
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql
-            """))
-            await conn.execute(text("DROP TRIGGER IF EXISTS threat_search_vector_update ON threats"))
-            await conn.execute(text("""
-                CREATE TRIGGER threat_search_vector_update
-                BEFORE INSERT OR UPDATE ON threats
-                FOR EACH ROW
-                EXECUTE FUNCTION update_threat_search_vector()
-            """))
+        # Add extracted_data column to asr_rules if it doesn't exist
+        await conn.execute(
+            text("""
+                ALTER TABLE asr_rules
+                ADD COLUMN IF NOT EXISTS extracted_data JSONB DEFAULT '{}'::jsonb
+            """)
+        )
 
-            # Add extracted_data column to asr_rules if it doesn't exist
-            await conn.execute(
-                text("""
-                    ALTER TABLE asr_rules
-                    ADD COLUMN IF NOT EXISTS extracted_data JSONB DEFAULT '{}'::jsonb
-                """)
+        # Add individual VDM file hash columns for incremental sync
+        await conn.execute(
+            text("""
+                ALTER TABLE vdm_versions
+                ADD COLUMN IF NOT EXISTS av_base_hash VARCHAR(64),
+                ADD COLUMN IF NOT EXISTS av_delta_hash VARCHAR(64),
+                ADD COLUMN IF NOT EXISTS as_base_hash VARCHAR(64),
+                ADD COLUMN IF NOT EXISTS as_delta_hash VARCHAR(64)
+            """)
+        )
+
+        # Add content_hash column to threats for change detection
+        await conn.execute(
+            text("""
+                ALTER TABLE threats
+                ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)
+            """)
+        )
+        # Backfill search vectors for existing rows
+        await conn.execute(text("""
+            UPDATE threats
+            SET search_vector = to_tsvector('english',
+                COALESCE(threat_name, '') || ' ' ||
+                COALESCE(category, '') || ' ' ||
+                COALESCE(family, '')
             )
+            WHERE search_vector IS NULL
+        """))
+        await conn.execute(text("""
+            ALTER TABLE sync_status
+            ADD COLUMN IF NOT EXISTS phase VARCHAR(32) NOT NULL DEFAULT 'starting',
+            ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS threats_processed INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS threats_total INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS lua_completed INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS lua_failed INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS lua_pending INTEGER NOT NULL DEFAULT 0
+        """))
+        await conn.execute(text("""
+            ALTER TABLE lua_scripts
+            ADD COLUMN IF NOT EXISTS decompilation_error TEXT,
+            ADD COLUMN IF NOT EXISTS decompilation_attempts INTEGER NOT NULL DEFAULT 0
+        """))
 
-            # Add individual VDM file hash columns for incremental sync
-            await conn.execute(
-                text("""
-                    ALTER TABLE vdm_versions
-                    ADD COLUMN IF NOT EXISTS av_base_hash VARCHAR(64),
-                    ADD COLUMN IF NOT EXISTS av_delta_hash VARCHAR(64),
-                    ADD COLUMN IF NOT EXISTS as_base_hash VARCHAR(64),
-                    ADD COLUMN IF NOT EXISTS as_delta_hash VARCHAR(64)
-                """)
-            )
-
-            # Add content_hash column to threats for change detection
-            await conn.execute(
-                text("""
-                    ALTER TABLE threats
-                    ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)
-                """)
-            )
-            # Backfill search vectors for existing rows
-            await conn.execute(text("""
-                UPDATE threats
-                SET search_vector = to_tsvector('english',
-                    COALESCE(threat_name, '') || ' ' ||
-                    COALESCE(category, '') || ' ' ||
-                    COALESCE(family, '')
-                )
-                WHERE search_vector IS NULL
-            """))
-    except Exception as e:
-        print(f"Migration note: {e}")
+    # Signature replacement otherwise scans every Lua row for each cascading
+    # delete, which dominates updates to threats with many signatures.
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_lua_scripts_signature_id ON lua_scripts(signature_id)"))
 
     # Tracking must install successfully; otherwise do not claim that activity is tracked.
     from .services.history_migrations import install_history_tracking

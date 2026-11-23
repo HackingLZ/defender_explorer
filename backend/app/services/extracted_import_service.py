@@ -18,6 +18,7 @@ from ..models import ASRRule, LuaScript, Threat, FunctionDefinition, FUNCTION_MA
 from ..database import async_session_maker
 from .lua_pattern_extractor import extract_patterns_from_scripts, merge_external_function_data, ExtractedPatterns
 from .function_registry_service import FunctionRegistryService
+from .import_files import read_import_text, UnsafeImportFileError
 
 
 # Mapping of ASR rule names to GUIDs (for scripts that use GetRuleInfo)
@@ -109,7 +110,7 @@ class ExtractedImportService:
                     continue
 
                 try:
-                    content = sig_file.read_text(errors="replace")
+                    content = read_import_text(self.extracted_path, sig_file)
 
                     # Parse signature ID from content
                     sig_id_match = re.search(r"Signature ID: (0x[0-9a-fA-F]+)", content)
@@ -136,6 +137,8 @@ class ExtractedImportService:
                         stats.threats += len(batch)
                         batch = []
 
+                except UnsafeImportFileError as e:
+                    stats.errors.append(f"Rejected {sig_file}: {e}")
                 except Exception:
                     pass
 
@@ -177,7 +180,7 @@ class ExtractedImportService:
         # Walk through all .lua files
         for lua_file in lua_dir.rglob("*.lua"):
             try:
-                content = lua_file.read_text(errors="replace")
+                content = read_import_text(self.extracted_path, lua_file)
                 # Remove null bytes and other problematic characters
                 content = content.replace('\x00', '').replace('\x13', '').replace('\x0f', '')
                 bytecode_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -196,6 +199,8 @@ class ExtractedImportService:
                     stats.lua_scripts += len(batch)
                     batch = []
 
+            except UnsafeImportFileError as e:
+                stats.errors.append(f"Rejected {lua_file}: {e}")
             except Exception:
                 pass
 
@@ -344,7 +349,7 @@ class ExtractedImportService:
 
             for lua_file in search_dir.rglob("*.lua"):
                 try:
-                    content = lua_file.read_text(errors="replace")
+                    content = read_import_text(self.extracted_path, lua_file)
                     content = content.replace('\x00', '').replace('\x13', '').replace('\x0f', '')
 
                     # Find all function definitions
@@ -375,6 +380,8 @@ class ExtractedImportService:
                                 f"Found {func_name} with {len(entries)} entries in {lua_file}"
                             )
 
+                except UnsafeImportFileError as e:
+                    logger.warning("Rejected %s: %s", lua_file, e)
                 except Exception as e:
                     logger.debug(f"Error reading {lua_file}: {e}")
 
@@ -446,14 +453,14 @@ class ExtractedImportService:
 
             # Collect lua scripts and their content
             lua_files = list(guid_dir.glob("*.lua"))
-            script_count = len(lua_files)
+            script_count = 0
             script_contents = []
             calls_external_functions = False
 
             # Import lua scripts and collect content for pattern extraction
             for lua_file in lua_files:
                 try:
-                    content = lua_file.read_text(errors="replace")
+                    content = read_import_text(self.extracted_path, lua_file)
                     # Remove null bytes and problematic characters
                     content = content.replace('\x00', '').replace('\x13', '').replace('\x0f', '')
                     script_contents.append(content)
@@ -484,6 +491,9 @@ class ExtractedImportService:
                     )
                     await self.db.execute(stmt)
                     stats.lua_scripts += 1
+                    script_count += 1
+                except UnsafeImportFileError as e:
+                    stats.errors.append(f"Rejected {lua_file}: {e}")
                 except Exception:
                     pass
 

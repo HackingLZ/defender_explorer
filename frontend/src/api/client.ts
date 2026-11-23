@@ -193,6 +193,14 @@ export interface ServiceStatus {
   last_sync: string | null
   current_version: string | null
   sync_started_at: string | null
+  phase: string | null
+  heartbeat_at: string | null
+  elapsed_seconds: number
+  threats_processed: number
+  threats_total: number
+  lua_completed: number
+  lua_failed: number
+  lua_pending: number
   threats_added: number
   threats_updated: number
   threats_removed: number
@@ -514,6 +522,7 @@ export const browseSignatures = (params: {
 export const searchSignatures = (params: {
   q: string
   category?: string
+  subcategory?: string
   page?: number
   page_size?: number
 }) => api.get<SignatureSearchResponse>('/signatures/search', { params })

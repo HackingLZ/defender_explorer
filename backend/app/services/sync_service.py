@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..database import async_session_maker
 from ..models import Threat, Signature, LuaScript, VDMVersion, SyncStatus
 from .import_service import ImportService, ImportStats, import_asr_rules
+from .vdm_service import decompress_vdm, hash_vdm, merge_vdm
+from .sync_lifecycle import exclusive_sync, set_progress
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ class VDMFileHashes:
     @property
     def combined_hash(self) -> str:
         """Compute combined hash for all files."""
-        combined = hashlib.sha256()
+        combined = hashlib.sha256(b"verified-delta-v1:")
         for h in [self.av_base, self.av_delta, self.as_base, self.as_delta]:
             if h:
                 combined.update(h.encode())
@@ -200,7 +202,6 @@ def _download_and_extract_vdm() -> VDMDownloadResult:
     """
     from defender_sig_extractor.downloader import download_mpam_to_temp
     from defender_sig_extractor.pe_extractor import PEExtractor, get_vdm_files
-    import sys
 
     print("Starting MPAM download from Microsoft...", flush=True)
     logger.info("Starting MPAM download from Microsoft...")
@@ -211,24 +212,17 @@ def _download_and_extract_vdm() -> VDMDownloadResult:
     # Create temp directory for extraction
     temp_dir = tempfile.mkdtemp(prefix="vdm_extract_")
 
-    logger.info("Extracting VDM files from MPAM...")
-    pe_extractor = PEExtractor(mpam_path)
-    pe_extractor.extract_vdm_files(temp_dir)
-
-    # Use get_vdm_files to properly categorize (av_base, av_delta, as_base, as_delta)
-    vdm_files = get_vdm_files(temp_dir)
-
-    if not vdm_files:
-        raise ValueError("No VDM files found in MPAM")
-
-    for key, path in vdm_files.items():
-        logger.info(f"Found VDM file: {key} -> {Path(path).name}")
-
-    return VDMDownloadResult(
-        vdm_files=vdm_files,
-        temp_dir=temp_dir,
-        mpam_path=mpam_path,
-    )
+    result = VDMDownloadResult({}, temp_dir, mpam_path)
+    try:
+        logger.info("Extracting VDM files from MPAM...")
+        PEExtractor(mpam_path).extract_vdm_files(temp_dir)
+        result.vdm_files = get_vdm_files(temp_dir)
+        if not result.vdm_files:
+            raise ValueError("No VDM files found in MPAM")
+        return result
+    except BaseException:
+        _cleanup_temp_files(result)
+        raise
 
 
 def _cleanup_temp_files(result: VDMDownloadResult) -> None:
@@ -251,6 +245,7 @@ def _cleanup_temp_files(result: VDMDownloadResult) -> None:
         logger.warning(f"Failed to clean up MPAM file {result.mpam_path}: {e}")
 
 
+@exclusive_sync
 async def run_sync(sync_id: int) -> None:
     """
     Run a sync operation in the background.
@@ -272,6 +267,7 @@ async def run_sync(sync_id: int) -> None:
                 .where(SyncStatus.id == sync_id)
                 .values(
                     status="failed",
+                    phase="failed",
                     completed_at=datetime.utcnow(),
                     error_message=f"Import error: {e}",
                 )
@@ -281,23 +277,40 @@ async def run_sync(sync_id: int) -> None:
 
         try:
             # Run download and extraction in thread pool to avoid blocking event loop
+            await set_progress(db, sync_id, "downloading")
             loop = asyncio.get_event_loop()
             print(f"Sync {sync_id}: Starting download in background thread...", flush=True)
             logger.info(f"Sync {sync_id}: Starting download in background thread...")
-            download_result = await loop.run_in_executor(_sync_executor, _download_and_extract_vdm)
+            download_future = loop.run_in_executor(_sync_executor, _download_and_extract_vdm)
+            try:
+                download_result = await asyncio.shield(download_future)
+            except asyncio.CancelledError:
+                # Thread cancellation cannot stop a download. Reap its temporary
+                # files when it finishes, without letting it start an import.
+                def cleanup_finished(future):
+                    try:
+                        _cleanup_temp_files(future.result())
+                    except Exception:
+                        logger.exception("Cancelled sync download failed")
+                download_future.add_done_callback(cleanup_finished)
+                raise
             print(f"Sync {sync_id}: Download complete, got {len(download_result.vdm_files)} files", flush=True)
 
             logger.info(f"Sync {sync_id}: Importing {len(download_result.vdm_files)} VDM files...")
-            await _import_vdm_files(db, sync_id, download_result.vdm_files)
+            await _import_vdm_files(db, sync_id, download_result.vdm_files, authoritative=True)
             logger.info(f"Sync {sync_id}: Import complete")
 
         except Exception as e:
             logger.exception(f"Sync {sync_id} failed: {e}")
+            # A database error aborts the transaction. Roll it back before
+            # recording failure, or this update fails too and leaves it running.
+            await db.rollback()
             await db.execute(
                 update(SyncStatus)
                 .where(SyncStatus.id == sync_id)
                 .values(
                     status="failed",
+                    phase="failed",
                     completed_at=datetime.utcnow(),
                     error_message="Sync failed. Check server logs for details.",
                 )
@@ -309,6 +322,7 @@ async def run_sync(sync_id: int) -> None:
                 _cleanup_temp_files(download_result)
 
 
+@exclusive_sync
 async def run_local_import(sync_id: int, vdm_path: str) -> None:
     """
     Run import from a local VDM file.
@@ -324,11 +338,13 @@ async def run_local_import(sync_id: int, vdm_path: str) -> None:
             logger.info(f"Local import {sync_id}: Complete")
         except Exception as e:
             logger.exception(f"Local import {sync_id} failed: {e}")
+            await db.rollback()
             await db.execute(
                 update(SyncStatus)
                 .where(SyncStatus.id == sync_id)
                 .values(
                     status="failed",
+                    phase="failed",
                     completed_at=datetime.utcnow(),
                     error_message="Import failed. Check server logs for details.",
                 )
@@ -336,282 +352,134 @@ async def run_local_import(sync_id: int, vdm_path: str) -> None:
             await db.commit()
 
 
-def _parse_vdm_sync(vdm_path: str) -> tuple[bytes, str]:
-    """
-    Synchronous helper to parse VDM file and compute hash.
-
-    Runs in a thread pool to avoid blocking the async event loop.
-
-    Returns:
-        Tuple of (decompressed_data, content_hash)
-    """
-    from defender_sig_extractor.vdm_parser import VDMParser
-
-    print(f"Parsing VDM file: {vdm_path}", flush=True)
-    parser = VDMParser(vdm_path)
-    decompressed = parser.decompress()
-    content_hash = hashlib.sha256(decompressed).hexdigest()
-    print(f"VDM decompressed: {len(decompressed)} bytes, hash: {content_hash[:16]}...", flush=True)
-    return decompressed, content_hash
-
-
-def _extract_threats_from_vdm(vdm_path: str) -> List[Any]:
-    """
-    Extract threats from a single VDM file.
-
-    Args:
-        vdm_path: Path to VDM file
-
-    Returns:
-        List of ThreatDefinitions
-    """
-    from defender_sig_extractor.vdm_parser import VDMParser
+def _extract_threats_from_data(data: bytes) -> List[Any]:
+    """Extract threats from data already bounded by the VDM worker."""
     from defender_sig_extractor.signature_extractor import extract_threats
 
-    logger.info(f"Parsing VDM: {Path(vdm_path).name}")
-    parser = VDMParser(vdm_path)
-    data = parser.decompress()
-    logger.info(f"Decompressed: {len(data)} bytes")
-
+    from defender_sig_extractor.delta_patcher import records
+    in_threat = False
+    for kind, payload in records(data):
+        if kind in (0x73, 0x74):
+            raise ValueError("Unapplied delta records in snapshot")
+        if kind == 0x5c:
+            if in_threat or len(payload) < 13:
+                raise ValueError("Malformed threat record")
+            in_threat = True
+        elif kind == 0x5d:
+            in_threat = False
+    if in_threat:
+        raise ValueError("Unterminated threat record")
     threats = list(extract_threats(data))
-    logger.info(f"Extracted {len(threats)} threats from {Path(vdm_path).name}")
+    logger.info(f"Extracted {len(threats)} threats")
 
     return threats
 
 
-async def _import_vdm_files(db: AsyncSession, sync_id: int, vdm_files: dict) -> None:
-    """Internal function to import multiple VDM files with incremental sync support.
-
-    Args:
-        db: Database session
-        sync_id: Sync status record ID
-        vdm_files: Dict mapping VDM type to path (av_base, av_delta, as_base, as_delta)
-    """
-    print(f"_import_vdm_files called with {len(vdm_files)} files: {list(vdm_files.keys())}", flush=True)
-
-    try:
-        from defender_sig_extractor.vdm_parser import VDMParser
-        from defender_sig_extractor.signature_extractor import extract_threats
-    except ImportError as e:
-        raise ImportError(f"defender_sig_extractor not available: {e}")
-
-    loop = asyncio.get_event_loop()
-
-    # Compute hashes for individual VDM files
-    print("Computing file hashes...", flush=True)
-    file_hashes = VDMFileHashes()
-    for key in ['av_base', 'av_delta', 'as_base', 'as_delta']:
-        if key in vdm_files:
-            print(f"Hashing {key}...", flush=True)
-            _, content_hash = await loop.run_in_executor(
-                _sync_executor, _parse_vdm_sync, vdm_files[key]
-            )
-            setattr(file_hashes, key.replace('-', '_'), content_hash)
-            print(f"Done hashing {key}: {content_hash[:16]}...", flush=True)
-
-    version_hash = file_hashes.combined_hash
-    print(f"Combined version hash: {version_hash[:16]}...", flush=True)
-
-    # Check if we already have this exact version
-    print("Checking for existing version...", flush=True)
-    existing = await db.execute(
-        select(VDMVersion).where(VDMVersion.version_hash == version_hash)
+async def _extract_threats_from_vdm(vdm_path: str) -> List[Any]:
+    data = await decompress_vdm(vdm_path)
+    return await asyncio.get_running_loop().run_in_executor(
+        _sync_executor, _extract_threats_from_data, data
     )
-    if existing.scalar_one_or_none():
-        print("Version already imported, skipping", flush=True)
-        await db.execute(
-            update(SyncStatus)
-            .where(SyncStatus.id == sync_id)
-            .values(
-                status="completed",
-                completed_at=datetime.utcnow(),
-                error_message="No changes - version already imported",
-            )
-        )
+
+
+async def _import_vdm_files(db: AsyncSession, sync_id: int, vdm_files: dict, *, authoritative=False) -> None:
+    """Reconstruct snapshots, reuse unchanged threats, then reconcile removals.
+
+    Only a complete downloaded AV/AS snapshot can remove absent records.
+    A single-file local import is additive and never deletes unrelated data.
+    Failed batches can be retried: stored hashes skip already committed work.
+    """
+    if authoritative and set(vdm_files) != {"av_base", "av_delta", "as_base", "as_delta"}:
+        raise ValueError("A complete AV/AS base and delta snapshot is required")
+    for family in ("av", "as"):
+        if f"{family}_delta" in vdm_files and f"{family}_base" not in vdm_files:
+            raise ValueError("A delta requires its matching base")
+
+    file_hashes = VDMFileHashes()
+    for key in ('av_base', 'av_delta', 'as_base', 'as_delta'):
+        if key in vdm_files:
+            setattr(file_hashes, key, await hash_vdm(vdm_files[key]))
+    version_hash = file_hashes.combined_hash
+    existing = await db.scalar(select(VDMVersion).where(VDMVersion.version_hash == version_hash))
+    # A failed newer update may have committed batches. Reconcile even when
+    # returning to the current/previous snapshot instead of blindly skipping.
+    failed_since = None
+    if existing is not None:
+        failed_since = await db.scalar(select(SyncStatus.id).where(
+            SyncStatus.status == "failed", SyncStatus.started_at >= existing.download_timestamp,
+        ).limit(1))
+    if existing is not None and existing.is_current and not failed_since:
+        from .decompilation_service import get_decompilation_stats
+        lua = await get_decompilation_stats()
+        await db.execute(update(SyncStatus).where(SyncStatus.id == sync_id).values(
+            status="completed", phase="completed", completed_at=datetime.utcnow(),
+            error_message="No changes - version already imported",
+            lua_completed=lua.get("completed", 0), lua_failed=lua.get("failed", 0), lua_pending=lua.get("pending", 0),
+        ))
         await db.commit()
         return
 
-    print("New version, proceeding with import...", flush=True)
     db.info["vdm_version_hash"] = version_hash
+    # after_begin propagates provenance to subsequent batch transactions.
     await db.execute(text("SELECT set_config('app.vdm_version_hash', :version_hash, true)"),
                      {"version_hash": version_hash})
-
-    # Check if we have existing data and can do incremental sync
-    current_version = await db.execute(
-        select(VDMVersion).where(VDMVersion.is_current == True)
-    )
-    current = current_version.scalar_one_or_none()
-
-    # Determine if we can do incremental sync
-    # Incremental sync is possible if:
-    # 1. We have existing data (current version exists)
-    # 2. Base files haven't changed (only deltas changed)
-    can_do_incremental = False
-    if current:
-        base_unchanged = (
-            current.av_base_hash == file_hashes.av_base and
-            current.as_base_hash == file_hashes.as_base
-        )
-        if base_unchanged:
-            can_do_incremental = True
-            print("Base files unchanged - using incremental sync", flush=True)
-        else:
-            print("Base files changed - doing full import", flush=True)
-    else:
-        print("No current version - doing full import", flush=True)
-
-    # Import ASR rules first
-    print("Importing ASR rules...", flush=True)
     await import_asr_rules(db)
-    print("ASR rules imported", flush=True)
-
-    # Extract threats from all VDM files
-    # Process each file separately (base and delta files both contain signatures)
-    print("Starting threat extraction from VDM files...", flush=True)
-    file_order = ['av_base', 'av_delta', 'as_base', 'as_delta']
-
-    # Perform sync (incremental or full)
-    sync_service = SyncService(db)
-    import_service = ImportService(db)
-
-    total_threats_added = 0
-    total_threats_updated = 0
-    total_threats_removed = 0
-    total_signatures_added = 0
-
-    if can_do_incremental:
-        # Incremental sync: compute delta and apply changes
-        all_threats = []
-        for vdm_key in file_order:
-            vdm_path = vdm_files.get(vdm_key)
-            if vdm_path:
-                print(f"Extracting threats from {vdm_key}...", flush=True)
-                threats = await loop.run_in_executor(
-                    _sync_executor,
-                    _extract_threats_from_vdm,
-                    vdm_path,
-                )
-                all_threats.extend(threats)
-                print(f"Processed {vdm_key}: {len(threats)} threats", flush=True)
-
-        threats_by_id = {t.signature_id: t for t in all_threats}
-        logger.info(f"Total threats to sync: {len(threats_by_id)}")
-
-        if len(threats_by_id) == 0:
-            logger.error("No threats extracted from VDM files - aborting sync")
-            await db.execute(
-                update(SyncStatus)
-                .where(SyncStatus.id == sync_id)
-                .values(
-                    status="failed",
-                    completed_at=datetime.utcnow(),
-                    error_message="No threats extracted from VDM files",
-                )
-            )
-            await db.commit()
-            return
-
-        logger.info("Computing delta between new VDM and database...")
-        delta = await sync_service.compute_delta(all_threats)
-
-        logger.info(f"Delta: +{len(delta.added)} added, -{len(delta.removed)} removed, ~{len(delta.potentially_modified)} to check")
-
-        if not delta.added and not delta.removed and not delta.potentially_modified:
-            logger.info("No changes detected")
-            await db.execute(
-                update(SyncStatus)
-                .where(SyncStatus.id == sync_id)
-                .values(
-                    status="completed",
-                    completed_at=datetime.utcnow(),
-                    error_message="No changes detected",
-                )
-            )
-            await db.commit()
-            return
-
-        stats = await sync_service.apply_incremental_update(delta, threats_by_id)
-        total_threats_added = stats.threats_added
-        total_threats_updated = stats.threats_updated
-        total_threats_removed = len(delta.removed)
-        total_signatures_added = stats.signatures_added
-
-    else:
-        # Full import: stream each VDM file and import without building a combined list
-        logger.info("Performing full import (streamed)...")
-        stats = ImportStats()
-
-        # Disable decompilation during import to reduce memory pressure
-        import_service = ImportService(db, decompile_during_import=False)
-
-        total_threats = 0
-        processed = 0
-        batch_size = 100
-
-        for vdm_key in file_order:
-            vdm_path = vdm_files.get(vdm_key)
-            if not vdm_path:
-                continue
-            print(f"Extracting threats from {vdm_key}...", flush=True)
-            threats = await loop.run_in_executor(
-                _sync_executor,
-                _extract_threats_from_vdm,
-                vdm_path,
-            )
-            print(f"Processed {vdm_key}: {len(threats)} threats", flush=True)
-
-            total_threats += len(threats)
-            for threat_index, threat_def in enumerate(threats):
-                await import_service._import_threat(threat_def, stats)
-                # Signature payloads can be large. Drop the parsed object as soon
-                # as its database write has completed instead of retaining the
-                # entire VDM file for the duration of the import.
-                threats[threat_index] = None
-                processed += 1
-                if processed % batch_size == 0:
-                    await asyncio.sleep(0)
-                    if processed % 1000 == 0:
-                        # Persist progress so UI can reflect forward motion.
-                        await db.execute(
-                            update(SyncStatus)
-                            .where(SyncStatus.id == sync_id)
-                            .values(
-                                threats_added=stats.threats_added,
-                                threats_updated=stats.threats_updated,
-                            )
-                        )
-                        await db.commit()
-                        db.sync_session.expunge_all()
-                        if total_threats:
-                            logger.info(f"Import progress: {processed}/{total_threats} threats ({processed * 100 // total_threats}%)")
-                            print(f"Import progress: {processed}/{total_threats} threats ({processed * 100 // total_threats}%)", flush=True)
-
-            del threats
-            gc.collect()
-
-        total_threats_added = stats.threats_added
-        total_threats_updated = stats.threats_updated
-        total_signatures_added = stats.signatures_added
-        logger.info(
-            f"Import loop finished: processed={processed}, "
-            f"threats_added={total_threats_added}, threats_updated={total_threats_updated}, "
-            f"signatures_added={total_signatures_added}"
+    await set_progress(db, sync_id, "parsing")
+    stored = dict((await db.execute(select(Threat.signature_id, Threat.content_hash))).all())
+    import_service = ImportService(db, decompile_during_import=False)
+    stats = ImportStats()
+    seen = set()
+    processed = signatures = 0
+    for family in ("av", "as"):
+        base = vdm_files.get(f"{family}_base")
+        if not base:
+            continue
+        await set_progress(db, sync_id, "parsing")
+        delta = vdm_files.get(f"{family}_delta")
+        data = await merge_vdm(base, delta) if delta else await decompress_vdm(base)
+        threats = await asyncio.get_running_loop().run_in_executor(
+            _sync_executor, _extract_threats_from_data, data,
         )
-        print("Import loop finished, committing...", flush=True)
-        await db.commit()
-        print("Import commit done.", flush=True)
+        del data
+        if not threats:
+            raise ValueError("No threats extracted from VDM files")
+        total = processed + len(threats)
+        await set_progress(db, sync_id, "importing", threats_total=total)
+        for index, threat in enumerate(threats):
+            sig_id = threat.signature_id
+            if sig_id in seen:
+                raise ValueError("Duplicate threat ID in snapshot")
+            seen.add(sig_id)
+            content_hash = import_service._compute_threat_hash(threat)
+            if stored.get(sig_id) != content_hash:
+                await import_service._import_threat(threat, stats)
+            signatures += len(threat.signatures)
+            processed += 1
+            threats[index] = None
+            if processed % 1000 == 0:
+                await set_progress(db, sync_id, "importing", threats_processed=processed,
+                                   threats_added=stats.threats_added, threats_updated=stats.threats_updated)
+                db.sync_session.expunge_all()
+                await asyncio.sleep(0)
+        del threats
+        gc.collect()
 
-    # If we skipped decompilation during import, complete it now (bounded batches)
-    if isinstance(import_service, ImportService) and not import_service.decompile_during_import:
-        from .decompilation_service import decompile_all_pending
-        logger.info("Starting post-import decompilation to finalize ASR resolution...")
-        print("Starting post-import decompilation...", flush=True)
-        total_decompiled = await decompile_all_pending(batch_size=20)
-        logger.info(f"Post-import decompilation complete: {total_decompiled} scripts")
-        print(f"Post-import decompilation complete: {total_decompiled} scripts", flush=True)
+    if not seen:
+        raise ValueError("No threats extracted from VDM files")
+    removed = list(set(stored) - seen) if authoritative else []
+    # Defer removal until both families have parsed/imported successfully.
+    for offset in range(0, len(removed), 1000):
+        await db.execute(delete(Threat).where(Threat.signature_id.in_(removed[offset:offset + 1000])))
+    await set_progress(db, sync_id, "decompiling", threats_processed=processed, threats_total=processed,
+                       threats_added=stats.threats_added, threats_updated=stats.threats_updated,
+                       threats_removed=len(removed))
 
+    from .decompilation_service import decompile_all_pending, get_decompilation_stats
+    await decompile_all_pending(batch_size=20)
+    lua = await get_decompilation_stats()
+    warning = f"{lua.get('failed', 0)} Lua scripts failed; see admin decompilation diagnostics." if lua.get("failed") else None
     # Finalize ASR resolution (backfill GUIDs and update counts)
-    print("Finalizing ASR resolution...", flush=True)
+    await set_progress(db, sync_id, "resolving_asr")
     await import_service._finalize_asr_resolution()
     print("ASR resolution finalized.", flush=True)
 
@@ -649,43 +517,31 @@ async def _import_vdm_files(db: AsyncSession, sync_id: int, vdm_files: dict) -> 
         )
         print(f"ASR V2 resolution complete: {resolver_stats.rules_updated} rules, {resolver_stats.functions_resolved} functions", flush=True)
     except Exception as e:
+        await db.rollback()
+        warning = "ASR dependency resolution failed; check server logs."
         logger.warning(f"V2 ASR resolution failed (non-fatal): {e}")
         print(f"Warning: V2 ASR resolution failed: {e}", flush=True)
 
-    # Create version record with individual file hashes
-    version = VDMVersion(
-        version_hash=version_hash,
-        threat_count=total_threats_added + total_threats_updated,
-        signature_count=total_signatures_added,
-        is_current=True,
-        av_base_hash=file_hashes.av_base,
-        av_delta_hash=file_hashes.av_delta,
-        as_base_hash=file_hashes.as_base,
-        as_delta_hash=file_hashes.as_delta,
-    )
-
-    # Mark previous versions as not current
-    await db.execute(
-        update(VDMVersion).values(is_current=False)
-    )
-
-    db.add(version)
-
-    # Update sync status
-    await db.execute(
-        update(SyncStatus)
-        .where(SyncStatus.id == sync_id)
-        .values(
-            status="completed",
-            completed_at=datetime.utcnow(),
-            threats_added=total_threats_added,
-            threats_updated=total_threats_updated,
-            threats_removed=total_threats_removed,
-        )
-    )
-
+    # Reuse historical version rows when reverting/retrying a snapshot.
+    await db.execute(update(VDMVersion).values(is_current=False))
+    version = await db.scalar(select(VDMVersion).where(VDMVersion.version_hash == version_hash))
+    if version is None:
+        version = VDMVersion(version_hash=version_hash)
+        db.add(version)
+    version.is_current = True
+    version.download_timestamp = datetime.utcnow()
+    version.threat_count = len(seen)
+    version.signature_count = signatures
+    for key in ('av_base', 'av_delta', 'as_base', 'as_delta'):
+        setattr(version, key + "_hash", getattr(file_hashes, key))
+    await db.execute(update(SyncStatus).where(SyncStatus.id == sync_id).values(
+        status="completed", phase="completed", completed_at=datetime.utcnow(),
+        heartbeat_at=datetime.utcnow(), error_message=warning,
+        threats_added=stats.threats_added, threats_updated=stats.threats_updated,
+        threats_removed=len(removed), lua_completed=lua.get("completed", 0),
+        lua_failed=lua.get("failed", 0), lua_pending=lua.get("pending", 0),
+    ))
     await db.commit()
-    logger.info(f"Sync complete: +{total_threats_added} added, ~{total_threats_updated} updated, -{total_threats_removed} removed")
 
 
 async def _import_vdm_file(db: AsyncSession, sync_id: int, vdm_path: str) -> None:

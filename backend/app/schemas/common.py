@@ -38,6 +38,13 @@ class SyncStatusResponse(BaseModel):
     threats_updated: int
     threats_removed: int
     error_message: Optional[str] = None
+    phase: str = "queued"
+    heartbeat_at: Optional[datetime] = None
+    threats_processed: int = 0
+    threats_total: int = 0
+    lua_completed: int = 0
+    lua_failed: int = 0
+    lua_pending: int = 0
 
     class Config:
         from_attributes = True

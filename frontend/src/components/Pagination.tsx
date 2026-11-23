@@ -46,10 +46,12 @@ export default function Pagination({ page, pages, onPageChange }: PaginationProp
   }
 
   return (
-    <div className="flex items-center justify-center gap-1">
+    <nav aria-label="Pagination" className="flex flex-wrap items-center justify-center gap-1">
       <button
+        type="button"
+        aria-label="Previous page"
         onClick={() => onPageChange(page - 1)}
-        disabled={page === 1}
+        disabled={page <= 1}
         className={clsx(
           'p-2 border border-border-visible transition-colors',
           page === 1
@@ -64,6 +66,9 @@ export default function Pagination({ page, pages, onPageChange }: PaginationProp
         typeof pageNum === 'number' ? (
           <button
             key={idx}
+            type="button"
+            aria-label={`Page ${pageNum}`}
+            aria-current={pageNum === page ? 'page' : undefined}
             onClick={() => onPageChange(pageNum)}
             className={clsx(
               'min-w-[36px] px-3 py-2 text-xs font-medium uppercase tracking-wider border transition-colors',
@@ -82,8 +87,10 @@ export default function Pagination({ page, pages, onPageChange }: PaginationProp
       )}
 
       <button
+        type="button"
+        aria-label="Next page"
         onClick={() => onPageChange(page + 1)}
-        disabled={page === pages}
+        disabled={page >= pages}
         className={clsx(
           'p-2 border border-border-visible transition-colors',
           page === pages
@@ -93,6 +100,6 @@ export default function Pagination({ page, pages, onPageChange }: PaginationProp
       >
         <ChevronRight className="h-4 w-4" />
       </button>
-    </div>
+    </nav>
   )
 }

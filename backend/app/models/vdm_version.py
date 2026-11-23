@@ -37,6 +37,13 @@ class SyncStatus(Base):
     threats_updated = Column(Integer, default=0)
     threats_removed = Column(Integer, default=0)
     error_message = Column(Text)
+    phase = Column(String(32), default="queued", nullable=False)
+    heartbeat_at = Column(DateTime)
+    threats_processed = Column(Integer, default=0)
+    threats_total = Column(Integer, default=0)
+    lua_completed = Column(Integer, default=0)
+    lua_failed = Column(Integer, default=0)
+    lua_pending = Column(Integer, default=0)
 
 
 class AppSetting(Base):

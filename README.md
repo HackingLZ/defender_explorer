@@ -15,7 +15,7 @@ Browse, search, and analyze Microsoft Defender signature definitions. Parses VDM
 ## Requirements
 
 - Docker and Docker Compose
-- 8 GB RAM recommended (6 GB container limit + DB overhead)
+- 8 GB RAM recommended (3 GB app container limit plus database and Docker overhead)
 - ~5 GB disk for the database after initial sync
 
 ## Setup
@@ -42,7 +42,7 @@ The `VDM_PATH` and `EXTRACTED_PATH` in `.env` point to `./data/vdm` and `./data/
 docker compose up -d
 ```
 
-**3. Wait for initial sync (15–30 minutes)**
+**3. Wait for initial sync (allow 1–2 hours, depending on hardware and Lua decompilation)**
 
 On first start the app detects an empty database and automatically downloads and imports the current Defender definitions from Microsoft's update servers. You can watch progress in the logs:
 
@@ -95,6 +95,12 @@ PDF rendering and Lua decompilation run in bounded worker processes with hard
 deadlines. A busy PDF service returns a retryable error. Public status exposes
 sync progress without administrator diagnostics or credentials.
 
+VDM parsing accepts at most 256 MiB of file data and 512 MiB of expanded data
+per file, including fallback layouts and standalone extraction. API imports
+decompress in a disposable worker with a 120-second deadline and, on Linux,
+a 512 MiB memory limit. Files over these budgets fail the import; they are never
+silently truncated. Pre-import hashing stays inside that worker.
+
 ## Updating definitions
 
 After initial sync, the app schedules automatic updates. To trigger a manual
@@ -103,6 +109,41 @@ sync, export your configured `ADMIN_API_KEY` in the shell and call:
 ```bash
 curl -X POST http://localhost:8000/api/admin/sync -H "X-API-Key: $ADMIN_API_KEY"
 ```
+
+Each AV/AS delta is applied to its matching base before threats are parsed.
+The merge checks command bounds, output size, and the complemented CRC32 using
+the [documented DELTA_BLOB format](https://i.blackhat.com/BH-US-23/Presentations/US-23-Tomer-Defender-Pretender-final.pdf).
+An invalid or incomplete snapshot fails without publishing a successful version.
+A complete downloaded snapshot removes absent threats; single-file local imports
+remain additive. Unchanged threats are reused by content hash. Lua results are retained by
+bytecode hash even when their parent threat changes, including across retries
+of interrupted batches. Removed bytecode is cleaned up transactionally. Updates still download the
+MPAM package and reconstruct the snapshots; database writes are limited to changed threats. A changed threat can contain
+millions of signatures, so changed-version syncs can still take several minutes;
+an identical snapshot is skipped after hash verification.
+
+Manual, scheduled, and startup imports share a PostgreSQL advisory lock. Interrupted
+jobs are recovered on startup or the next sync request; a newly queued reservation
+has a one-minute grace period before recovery. Initial sync and interrupted updates
+are retried automatically on startup. The dashboard reports phases, elapsed time,
+heartbeat, threat progress, and Lua counts. `/health` checks the process; `/ready`
+checks database/schema access and is used by Docker's health check.
+
+Lua failures do not prevent browsing imported definitions. Inspect their reason
+codes (`no_source`, `decoder_error`, `timeout`, `input_limit_or_missing`, or
+`worker_failed`) and retry up to 500 failed scripts at a time:
+
+```bash
+curl http://localhost:8000/api/admin/decompilation/failures -H "X-API-Key: $ADMIN_API_KEY"
+curl -X POST http://localhost:8000/api/admin/decompilation/retry \
+  -H "X-API-Key: $ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{}'
+```
+
+Pass `{"script_ids":[123,456]}` to retry selected failures. Retries preserve the
+attempt count and run through the same bounded decompilation workers.
+The first sync after this upgrade rechecks existing records because older
+versions did not apply delta patches.
 
 ## Architecture
 
@@ -132,3 +173,14 @@ The database tests additionally require `TEST_DATABASE_URL` pointing to a
 database's application tables. Run them with
 `PYTHONPATH=backend:. python -m unittest discover -s backend/tests -p 'test_explorer_integration.py'`.
 Run `npm run build` in `frontend/` for the frontend type check and production build.
+
+The database suite also exercises compressed VDM parsing, local imports,
+real-format delta patches, repeated imports, full-refresh removal, concurrent
+reservations, interruption recovery, Lua retries, search after ingestion, and
+failed-import status handling. These checks use small generated VDM fixtures; they do not
+download Microsoft's full definition package.
+
+GitHub Actions builds the complete production image (including the frontend type
+check) and runs all backend tests against a fresh PostgreSQL database. Run all
+checks locally with `PYTHONPATH=backend:. python -m unittest discover -s backend/tests -v`
+and the disposable `TEST_DATABASE_URL` described above.

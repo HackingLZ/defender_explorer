@@ -274,7 +274,7 @@ async def browse_signatures(
 
     # Paginate
     offset = (page - 1) * page_size
-    query = query.offset(offset).limit(page_size)
+    query = query.order_by(Signature.id).offset(offset).limit(page_size)
 
     # Execute
     result = await db.execute(query)
@@ -322,37 +322,38 @@ async def browse_signatures(
 async def search_signatures(
     q: str = Query(..., min_length=2, description="Search query"),
     category: Optional[str] = Query(None, description="Filter by category"),
+    subcategory: Optional[str] = Query(None, description="Filter by subcategory"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, ge=1, le=100, description="Items per page"),
     db: AsyncSession = Depends(get_db),
 
 ):
     """Search signature content."""
-    # Build base query with ILIKE on extracted_text
+    # Reuse the same filters for results and totals so pagination stays accurate.
+    conditions = [Signature.extracted_text.ilike(f"%{_escape_like(q)}%")]
+    if category:
+        conditions.append(Signature.category == category)
+    if subcategory:
+        conditions.append(Signature.subcategory == subcategory)
+
     query = (
         select(Signature)
         .options(selectinload(Signature.threat))
-        .join(Threat, Signature.threat_id == Threat.id, isouter=True)
-        .where(Signature.extracted_text.ilike(f"%{_escape_like(q)}%"))
+        .where(*conditions)
     )
-
-    if category:
-        query = query.where(Signature.category == category)
 
     # Count total
     count_subquery = (
         select(func.count())
         .select_from(Signature)
-        .where(Signature.extracted_text.ilike(f"%{_escape_like(q)}%"))
+        .where(*conditions)
     )
-    if category:
-        count_subquery = count_subquery.where(Signature.category == category)
     count_result = await db.execute(count_subquery)
     total = count_result.scalar() or 0
 
     # Paginate
     offset = (page - 1) * page_size
-    query = query.offset(offset).limit(page_size)
+    query = query.order_by(Signature.id).offset(offset).limit(page_size)
 
     # Execute
     result = await db.execute(query)

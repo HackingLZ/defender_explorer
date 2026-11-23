@@ -1,215 +1,130 @@
-"""
-Delta Patcher - Apply delta patches to base VDM files
+"""Checked Microsoft Defender DELTA_BLOB reconstruction.
 
-Microsoft Defender uses delta updates to minimize download sizes.
-Delta files contain commands to copy from base or insert new data.
+Format reference: SafeBreach, Black Hat USA 2023, slides 58–73:
+https://i.blackhat.com/BH-US-23/Presentations/US-23-Tomer-Defender-Pretender-final.pdf
+Copy lengths are (command & 0x7fff) + 6; the header contains output
+length and complemented CRC32. Never accept a partial or unchecked result.
 """
 
+import io
 import struct
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import tempfile
+import zlib
 from pathlib import Path
 
-
-@dataclass
-class DeltaHeader:
-    """Delta file header information."""
-    version: int
-    checksum: int
-    base_size: int
-    output_size: int
+from .vdm_parser import VDMParser, MAX_VDM_DECOMPRESSED_SIZE
 
 
-@dataclass
-class DeltaCommand:
-    """Single delta patch command."""
-    is_copy: bool  # True = copy from base, False = literal bytes
-    offset: int    # Source offset (for copy) or data offset (for literal)
-    length: int    # Number of bytes
+def records(data):
+    """Walk complete TLV records, rejecting truncated headers and payloads."""
+    pos = 0
+    while pos < len(data):
+        if len(data) - pos < 4:
+            raise ValueError("Truncated VDM record header")
+        header = int.from_bytes(data[pos:pos + 4], "little")
+        size, kind = header >> 8, header & 255
+        end = pos + 4 + size
+        if end > len(data):
+            raise ValueError("Truncated VDM record payload")
+        yield kind, memoryview(data)[pos + 4:end]
+        pos = end
+
+
+def delta_blob(data):
+    entries = list(records(data))
+    if [kind for kind, _ in entries] != [0x74, 0x73]:
+        raise ValueError("Expected DELTA_BLOB_RECINFO followed by DELTA_BLOB")
+    return entries[1][1]
+
+
+def patch_to(base, blob, output, *, max_output=MAX_VDM_DECOMPRESSED_SIZE):
+    """Apply a blob using bounded reads from a seekable expanded base file."""
+    if len(blob) < 8:
+        raise ValueError("Truncated delta header")
+    expected_size, expected_crc = struct.unpack_from("<II", blob)
+    if not 0 < expected_size <= max_output:
+        raise ValueError("Delta output exceeds its size limit")
+    base.seek(0, 2)
+    base_size = base.tell()
+    pos, written, crc = 8, 0, 0
+    try:
+        output.seek(0)
+        output.truncate()
+        while pos < len(blob):
+            if len(blob) - pos < 2:
+                raise ValueError("Truncated delta command")
+            command = struct.unpack_from("<H", blob, pos)[0]
+            pos += 2
+            if command & 0x8000:
+                size = (command & 0x7fff) + 6
+                if len(blob) - pos < 4:
+                    raise ValueError("Truncated delta copy offset")
+                offset = struct.unpack_from("<I", blob, pos)[0]
+                pos += 4
+                if offset + size > base_size:
+                    raise ValueError("Delta copy exceeds base size")
+                base.seek(offset)
+                chunk = base.read(size)
+                if len(chunk) != size:
+                    raise ValueError("Incomplete delta base read")
+            else:
+                size = command
+                if not size or pos + size > len(blob):
+                    raise ValueError("Invalid delta literal")
+                chunk = blob[pos:pos + size]
+                pos += size
+            written += size
+            if written > expected_size:
+                raise ValueError("Delta output exceeds declared size")
+            output.write(chunk)
+            crc = zlib.crc32(chunk, crc)
+        if written != expected_size:
+            raise ValueError("Delta output size mismatch")
+        if (crc ^ 0xffffffff) != expected_crc:
+            raise ValueError("Delta output checksum mismatch (wrong base or damaged delta)")
+    except Exception:
+        output.seek(0)
+        output.truncate()
+        raise
 
 
 class DeltaPatcher:
-    """
-    Apply delta patches to base signature files.
+    """Apply a DELTA_BLOB payload to expanded base bytes."""
+    def __init__(self, base_data, delta_data):
+        self.base, self.delta = base_data, delta_data
 
-    Delta format:
-    - Header: 16 bytes
-      - version: uint32
-      - checksum: uint32
-      - base_size: uint32
-      - output_size: uint32
-
-    - Commands: Variable length
-      - 2-byte command pairs
-      - High bit of first byte indicates command type:
-        - 1: Copy from base[offset:offset+length]
-        - 0: Literal bytes from delta stream
-    """
-
-    def __init__(self, base_data: bytes, delta_data: bytes):
-        self.base = base_data
-        self.delta = delta_data
-        self.header: Optional[DeltaHeader] = None
-        self.commands: List[DeltaCommand] = []
-
-    def _parse_header(self) -> DeltaHeader:
-        """Parse delta file header."""
-        if len(self.delta) < 16:
-            raise ValueError("Delta file too short for header")
-
-        version, checksum, base_size, output_size = struct.unpack_from(
-            '<IIII', self.delta, 0
-        )
-
-        return DeltaHeader(
-            version=version,
-            checksum=checksum,
-            base_size=base_size,
-            output_size=output_size
-        )
-
-    def _parse_commands(self) -> List[Tuple[bool, int, int, bytes]]:
-        """
-        Parse delta commands.
-
-        Returns list of (is_copy, offset, length, literal_data) tuples.
-        For copy commands, literal_data is empty.
-        For literal commands, offset refers to delta stream position.
-        """
-        commands = []
-        offset = 16  # Skip header
-
-        while offset < len(self.delta):
-            if offset + 1 >= len(self.delta):
-                break
-
-            # Read command byte
-            cmd = self.delta[offset]
-
-            if cmd & 0x80:  # Copy command
-                # Parse copy command (variable length encoding)
-                copy_offset = 0
-                copy_length = 0
-                offset += 1
-
-                # Offset bytes (up to 4)
-                if cmd & 0x01:
-                    copy_offset |= self.delta[offset]
-                    offset += 1
-                if cmd & 0x02:
-                    copy_offset |= self.delta[offset] << 8
-                    offset += 1
-                if cmd & 0x04:
-                    copy_offset |= self.delta[offset] << 16
-                    offset += 1
-                if cmd & 0x08:
-                    copy_offset |= self.delta[offset] << 24
-                    offset += 1
-
-                # Length bytes (up to 3)
-                if cmd & 0x10:
-                    copy_length |= self.delta[offset]
-                    offset += 1
-                if cmd & 0x20:
-                    copy_length |= self.delta[offset] << 8
-                    offset += 1
-                if cmd & 0x40:
-                    copy_length |= self.delta[offset] << 16
-                    offset += 1
-
-                # Length of 0 means 0x10000
-                if copy_length == 0:
-                    copy_length = 0x10000
-
-                commands.append((True, copy_offset, copy_length, b''))
-
-            elif cmd:  # Literal command (cmd = length)
-                literal_length = cmd
-                offset += 1
-                literal_data = self.delta[offset:offset + literal_length]
-                offset += literal_length
-
-                commands.append((False, 0, literal_length, literal_data))
-
-            else:  # Reserved (cmd = 0)
-                break
-
-        return commands
-
-    def apply(self) -> bytes:
-        """Apply delta patch and return patched data."""
-        self.header = self._parse_header()
-        commands = self._parse_commands()
-
-        output = bytearray()
-
-        for is_copy, src_offset, length, literal_data in commands:
-            if is_copy:
-                # Copy from base
-                if src_offset + length > len(self.base):
-                    # Truncate if exceeds base size
-                    length = max(0, len(self.base) - src_offset)
-                if length > 0:
-                    output.extend(self.base[src_offset:src_offset + length])
-            else:
-                # Insert literal data
-                output.extend(literal_data)
-
-        return bytes(output)
+    def apply(self):
+        with io.BytesIO(self.base) as base, io.BytesIO() as output:
+            patch_to(base, self.delta, output)
+            return output.getvalue()
 
     @classmethod
-    def patch_files(cls, base_path: str, delta_path: str) -> bytes:
-        """Convenience method to patch files by path."""
-        with open(base_path, 'rb') as f:
-            base_data = f.read()
-        with open(delta_path, 'rb') as f:
-            delta_data = f.read()
-
-        patcher = cls(base_data, delta_data)
-        return patcher.apply()
+    def patch_files(cls, base_path, delta_path):
+        return cls(Path(base_path).read_bytes(), Path(delta_path).read_bytes()).apply()
 
 
 class VDMDeltaPatcher:
-    """
-    VDM-specific delta patcher.
+    def __init__(self, base_vdm_path, delta_vdm_path):
+        self.base_path, self.delta_path = base_vdm_path, delta_vdm_path
 
-    Handles decompression before patching and re-compression after.
-    """
+    def apply_to(self, output, *, max_input=None, max_output=MAX_VDM_DECOMPRESSED_SIZE):
+        limits = {"max_decompressed_size": max_output}
+        if max_input is not None:
+            limits["max_file_size"] = max_input
+        with tempfile.TemporaryFile() as base:
+            VDMParser(self.base_path, **limits).decompress_to(base)
+            delta = VDMParser(self.delta_path, **limits).decompress()
+            patch_to(base, delta_blob(delta), output, max_output=max_output)
 
-    def __init__(self, base_vdm_path: str, delta_vdm_path: str):
-        self.base_path = Path(base_vdm_path)
-        self.delta_path = Path(delta_vdm_path)
-
-    def apply(self) -> bytes:
-        """Apply VDM delta patch."""
-        from .vdm_parser import VDMParser
-
-        # Decompress both base and delta
-        base_parser = VDMParser(str(self.base_path))
-        delta_parser = VDMParser(str(self.delta_path))
-
-        try:
-            base_data = base_parser.decompress()
-        except Exception as e:
-            raise ValueError(f"Failed to decompress base VDM: {e}")
-
-        try:
-            delta_data = delta_parser.decompress()
-        except Exception as e:
-            raise ValueError(f"Failed to decompress delta VDM: {e}")
-
-        # Apply delta patch
-        patcher = DeltaPatcher(base_data, delta_data)
-        return patcher.apply()
+    def apply(self):
+        with io.BytesIO() as output:
+            self.apply_to(output)
+            return output.getvalue()
 
 
-def apply_delta(base_data: bytes, delta_data: bytes) -> bytes:
-    """Convenience function to apply delta patch."""
-    patcher = DeltaPatcher(base_data, delta_data)
-    return patcher.apply()
+def apply_delta(base_data, delta_data):
+    return DeltaPatcher(base_data, delta_data).apply()
 
 
-def combine_vdm_files(base_path: str, delta_path: str) -> bytes:
-    """Combine base and delta VDM files."""
-    patcher = VDMDeltaPatcher(base_path, delta_path)
-    return patcher.apply()
+def combine_vdm_files(base_path, delta_path):
+    return VDMDeltaPatcher(base_path, delta_path).apply()

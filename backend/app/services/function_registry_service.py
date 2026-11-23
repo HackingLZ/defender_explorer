@@ -16,6 +16,7 @@ from sqlalchemy import select, func, delete
 
 from ..models import FunctionDefinition, FUNCTION_MAPPINGS
 from ..database import async_session_maker
+from .import_files import read_import_text
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ async def discover_functions_from_directory(
 
     for lua_file in directory.rglob("*.lua"):
         try:
-            content = lua_file.read_text(errors="replace")
+            content = read_import_text(directory, lua_file)
             content = content.replace('\x00', '').replace('\x13', '').replace('\x0f', '')
 
             found = await service.discover_from_source(

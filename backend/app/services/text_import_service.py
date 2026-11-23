@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from ..models import LuaScript, FunctionDefinition, FUNCTION_MAPPINGS
+from .import_files import read_import_text
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,7 @@ class TextImportService:
         scripts_data = []
         for lua_file in lua_files:
             try:
-                content = lua_file.read_text(errors="replace")
+                content = read_import_text(lua_dir, lua_file)
                 # Clean problematic characters
                 content = content.replace('\x00', '').replace('\x13', '').replace('\x0f', '')
 

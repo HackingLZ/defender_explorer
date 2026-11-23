@@ -43,7 +43,7 @@ class DecompilationTests(unittest.IsolatedAsyncioTestCase):
         async def worker(*args, **kwargs):
             started.set()
             await release.wait()
-            return b'["return true", "completed", []]'
+            return b'["return true", "completed", [], null]'
 
         with patch.object(service, "async_session_maker", factory), patch.object(service, "run_worker", side_effect=worker) as run:
             first = asyncio.create_task(service.decompile_on_demand(None, 7))
@@ -65,11 +65,12 @@ class DecompilationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await service.decompile_on_demand(None, 7))
         statement = write.execute.call_args.args[0]
         self.assertEqual(statement.compile().params["decompilation_status"], "failed")
+        self.assertEqual(statement.compile().params["decompilation_error"], "timeout")
         write.commit.assert_awaited_once()
 
     async def test_stale_input_is_not_published(self):
         factory, read, write = self.database(updated=False)
-        with patch.object(service, "async_session_maker", factory), patch.object(service, "run_worker", return_value=b'["return true", "completed", []]'):
+        with patch.object(service, "async_session_maker", factory), patch.object(service, "run_worker", return_value=b'["return true", "completed", [], null]'):
             self.assertIsNone(await service.decompile_on_demand(None, 7))
         statement = str(write.execute.call_args.args[0])
         self.assertIn("lua_scripts.bytecode =", statement)

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
 from ..models import Threat, Signature, LuaScript, ASRRule
 from ..database import async_session_maker
 from .signature_classifier import classify_signature, extract_searchable_text
+from .vdm_service import decompress_vdm
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +30,14 @@ _import_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="import_
 _lua_decompile_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lua_import_worker")
 
 
-def _parse_and_extract_threats(vdm_path: str) -> List[Any]:
+def _parse_and_extract_threats(decompressed: bytes) -> List[Any]:
     """
-    Parse VDM file and extract threats (runs in thread pool).
+    Extract threats from bounded VDM data (runs in thread pool).
 
     This is CPU-intensive work that should not block the event loop.
     """
-    from defender_sig_extractor.vdm_parser import VDMParser
     from defender_sig_extractor.signature_extractor import extract_threats
 
-    logger.info(f"Thread: Decompressing VDM file...")
-    parser = VDMParser(vdm_path)
-    decompressed = parser.decompress()
     logger.info(f"Thread: Decompressed {len(decompressed)} bytes, extracting threats...")
 
     threats = list(extract_threats(decompressed))
@@ -99,12 +96,13 @@ class ImportService:
         """
         stats = ImportStats()
 
-        # Run VDM parsing and threat extraction in thread pool (CPU-intensive)
+        # Isolate decompression before extracting the bounded signature stream.
+        decompressed = await decompress_vdm(vdm_path)
         loop = asyncio.get_event_loop()
-        logger.info(f"Parsing VDM file in background thread: {vdm_path}")
         threats = await loop.run_in_executor(
-            _import_executor, _parse_and_extract_threats, vdm_path
+            _import_executor, _parse_and_extract_threats, decompressed
         )
+        del decompressed
         total = len(threats)
         logger.info(f"Extracted {total} threats, starting bulk database import...")
 
@@ -379,12 +377,16 @@ class ImportService:
         )
         existing_threat = existing.scalar_one_or_none()
 
+        detached_lua_ids = []
         if existing_threat:
             # Update existing threat
-            # Clear existing signatures/Lua scripts to avoid duplication on re-import
-            await self.db.execute(
-                delete(LuaScript).where(LuaScript.threat_id == existing_threat.id)
-            )
+            # Keep bytecode-keyed results while replacing their signature rows.
+            # Detachment, reattachment, and removal share this transaction, so
+            # readers never see incomplete links and rollback restores the cache.
+            detached_lua_ids = (await self.db.execute(
+                update(LuaScript).where(LuaScript.threat_id == existing_threat.id)
+                .values(signature_id=None, threat_id=None).returning(LuaScript.id)
+            )).scalars().all()
             await self.db.execute(
                 delete(Signature).where(Signature.threat_id == existing_threat.id)
             )
@@ -463,6 +465,13 @@ class ImportService:
                 extract_guids_from_bytecode,
                 decompile_lua_safe if self.decompile_during_import else None
             )
+
+        # Purge only this replacement's scripts that no longer occur in it.
+        for offset in range(0, len(detached_lua_ids), 1000):
+            await self.db.execute(delete(LuaScript).where(
+                LuaScript.id.in_(detached_lua_ids[offset:offset + 1000]),
+                LuaScript.threat_id.is_(None), LuaScript.signature_id.is_(None),
+            ))
 
     def _compute_threat_hash(self, threat_def) -> str:
         """Compute a content hash for a threat definition."""
@@ -757,6 +766,7 @@ class ImportService:
                     LuaScript.asr_guids,
                     LuaScript.decompiled_source,
                     LuaScript.decompilation_status,
+                    LuaScript.threat_id,
                 ).where(LuaScript.bytecode_hash.in_(hashes))
             )
             existing_by_hash = {row[1]: row for row in existing_rows.all()}
@@ -767,9 +777,13 @@ class ImportService:
                 existing = existing_by_hash.get(bytecode_hash)
                 if existing:
                     # Re-extract ASR GUIDs if missing
-                    existing_id, _, asr_guids, decompiled_source, decomp_status = existing
+                    existing_id, _, asr_guids, decompiled_source, decomp_status, owner_id = existing
+                    if owner_id is None:
+                        await self.db.execute(update(LuaScript).where(LuaScript.id == existing_id).values(
+                            signature_id=signature_id, threat_id=threat_id, bytecode=bytecode,
+                        ))
                     if not asr_guids:
-                        if not decompiled_source:
+                        if not decompiled_source and decompile_lua_safe:
                             decompiled_source, decomp_status = await decompile_one(bytecode)
                         guids = list(extract_guids_from_bytecode(bytecode)) if extract_guids_from_bytecode else []
                         if decompiled_source and extract_guids_from_source:

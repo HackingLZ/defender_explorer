@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import async_session_maker
 from ..models import LuaScript
-from .process_worker import run_worker
+from .process_worker import run_worker, WorkerTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +33,12 @@ _background_task: Optional[asyncio.Task] = None
 _shutdown_event: Optional[asyncio.Event] = None
 
 
-def _decompile_bytecode_sync(bytecode: bytes) -> tuple[Optional[str], str, list[str]]:
+def _decompile_bytecode_sync(bytecode: bytes) -> tuple[Optional[str], str, list[str], Optional[str]]:
     """
     Synchronously decompile Lua bytecode (runs in a disposable process).
 
     Returns:
-        Tuple of (decompiled_source, status, asr_guids)
+        Tuple of (decompiled_source, status, asr_guids, error_code)
     """
     try:
         from defender_sig_extractor.lua_decompiler import decompile_bytecode
@@ -52,10 +52,10 @@ def _decompile_bytecode_sync(bytecode: bytes) -> tuple[Optional[str], str, list[
             all_guids = extract_guids_from_source(source)
             asr_guids = [g.lower() for g in all_guids if g and g.lower() in ASR_RULES]
 
-        return source, "completed" if source else "failed", asr_guids
+        return source, "completed" if source else "failed", asr_guids, None if source else "no_source"
     except Exception as e:
-        logger.debug(f"Decompilation failed: {e}")
-        return None, "failed", []
+        logger.warning("Decompiler rejected input: %s", type(e).__name__)
+        return None, "failed", [], "decoder_error"
 
 
 def _decompile_worker(bytecode: bytes, output_path: str) -> None:
@@ -72,25 +72,28 @@ async def _run_decompilation(script_id: int) -> Optional[str]:
             script = result.scalar_one_or_none()
             if not script:
                 return None
-            if script.decompilation_status != "pending" or not script.bytecode:
+            if script.decompilation_status != "pending":
                 return script.decompiled_source
             bytecode = script.bytecode
             previous_guids = script.asr_guids or []
 
         # Release the connection while CPU work runs.
         try:
+            if not bytecode:
+                raise ValueError("missing_bytecode")
             if len(bytecode) > _DECOMPILE_MAX_BYTES:
                 raise ValueError("Decompiler input exceeds its limit")
             result = await run_worker(
                 _decompile_worker, (bytecode,), timeout=_DECOMPILE_TIMEOUT,
                 max_output=_DECOMPILE_MAX_BYTES,
             )
-            source, status, asr_guids = json.loads(result)
+            source, status, asr_guids, error = json.loads(result)
             if status == "failed":
                 asr_guids = previous_guids
         except Exception as exc:
             logger.warning("Decompilation failed for script %s: %s", script_id, exc)
             source, status, asr_guids = None, "failed", previous_guids
+            error = "timeout" if isinstance(exc, WorkerTimeoutError) else "input_limit_or_missing" if isinstance(exc, ValueError) else "worker_failed"
 
         async with async_session_maker() as db:
             # An import may replace the bytecode while this process is running.
@@ -105,6 +108,8 @@ async def _run_decompilation(script_id: int) -> Optional[str]:
                 .values(
                     decompiled_source=source,
                     decompilation_status=status,
+                    decompilation_error=error,
+                    decompilation_attempts=LuaScript.decompilation_attempts + 1,
                     asr_guids=asr_guids,
                     is_asr_script=bool(asr_guids),
                 )
@@ -206,21 +211,24 @@ async def _decompile_batch(batch_size: int = 10) -> int:
         result = await db.execute(
             select(LuaScript.id)
             .where(LuaScript.decompilation_status == "pending")
-            .where(LuaScript.bytecode.isnot(None))
             .order_by(LuaScript.is_asr_script.desc())  # ASR first
             .limit(batch_size)
         )
         script_ids = result.scalars().all()
 
     processed = 0
-    for script_id in script_ids:
-        task = _get_or_start_job(script_id)
-        if task is None and _decompile_jobs:
-            await asyncio.wait(list(_decompile_jobs.values()), return_when=asyncio.FIRST_COMPLETED)
+    for offset in range(0, len(script_ids), _DECOMPILE_CONCURRENCY):
+        tasks = []
+        for script_id in script_ids[offset:offset + _DECOMPILE_CONCURRENCY]:
             task = _get_or_start_job(script_id)
-        if task is not None:
-            await asyncio.shield(task)
-            processed += 1
+            while task is None and _decompile_jobs:
+                await asyncio.wait(list(_decompile_jobs.values()), return_when=asyncio.FIRST_COMPLETED)
+                task = _get_or_start_job(script_id)
+            if task is not None:
+                tasks.append(asyncio.shield(task))
+        if tasks:
+            await asyncio.gather(*tasks)
+            processed += len(tasks)
     return processed
 
 

@@ -24,6 +24,16 @@ from .signature_types import get_type_name, is_lua_type
 RMDX_SIGNATURE = b'RMDX'
 RSTR_SIGNATURE = b'RSTR'
 
+# Apply to every caller, including the standalone extractor. Header lengths are
+# untrusted and must never determine the allocation budget.
+MAX_VDM_FILE_SIZE = 256 * 1024 * 1024
+MAX_VDM_DECOMPRESSED_SIZE = 512 * 1024 * 1024
+_DECOMPRESS_CHUNK_SIZE = 64 * 1024
+
+
+class VDMSizeLimitError(ValueError):
+    """The VDM exceeds its input or expanded-data budget."""
+
 
 @dataclass
 class Signature:
@@ -59,8 +69,13 @@ class VDMInfo:
 class VDMParser:
     """Parser for Microsoft Defender VDM signature files."""
 
-    def __init__(self, vdm_path: str):
+    def __init__(self, vdm_path: str, *, max_file_size: int = MAX_VDM_FILE_SIZE,
+                 max_decompressed_size: int = MAX_VDM_DECOMPRESSED_SIZE):
+        if max_file_size <= 0 or max_decompressed_size <= 0:
+            raise ValueError("VDM size limits must be positive")
         self.path = Path(vdm_path)
+        self.max_file_size = max_file_size
+        self.max_decompressed_size = max_decompressed_size
         self._data: Optional[bytes] = None
         self._decompressed: Optional[bytes] = None
         self._pe = None
@@ -134,62 +149,105 @@ class VDMParser:
         if self._decompressed is not None:
             return self._decompressed
 
+        with io.BytesIO() as output:
+            self.decompress_to(output)
+            self._decompressed = output.getvalue()
+        return self._decompressed
+
+    def _inflate_to(self, compressed: memoryview, wbits: int, output: BinaryIO) -> None:
+        """Inflate one candidate, bounding each allocation and the total output."""
+        output.seek(0)
+        output.truncate()
+        inflater = zlib.decompressobj(wbits)
+        total = 0
+        for offset in range(0, len(compressed), _DECOMPRESS_CHUNK_SIZE):
+            pending = compressed[offset:offset + _DECOMPRESS_CHUNK_SIZE]
+            while True:
+                limit = min(_DECOMPRESS_CHUNK_SIZE, self.max_decompressed_size - total + 1)
+                chunk = inflater.decompress(pending, limit)
+                total += len(chunk)
+                if total > self.max_decompressed_size:
+                    # This is deliberately not zlib.error: no fallback may retry
+                    # or reinterpret a stream after it exceeds the budget.
+                    raise VDMSizeLimitError("VDM expanded data exceeds its size limit")
+                output.write(chunk)
+                if inflater.eof:
+                    return
+                pending = inflater.unconsumed_tail
+                if not pending and len(chunk) < limit:
+                    break
+                # A full output chunk can leave buffered output even when all
+                # input was consumed. Drain it with bounded empty-input calls.
+        # decompressobj accepts truncated streams unless eof is checked. Never
+        # flush without a bound or accept a partial signature database.
+        raise zlib.error("Incomplete VDM compressed stream")
+
+    def decompress_to(self, output: BinaryIO) -> None:
+        """Write to a seekable binary stream without materializing expanded data.
+
+        The destination is replaced and cleared on failure. Callers must only
+        consume it after this method returns successfully.
+        """
+        try:
+            self._decompress_to(output)
+        except Exception:
+            output.seek(0)
+            output.truncate()
+            raise
+
+    def _decompress_to(self, output: BinaryIO) -> None:
         with open(self.path, 'rb') as f:
-            data = f.read()
+            data = f.read(self.max_file_size + 1)
+        if len(data) > self.max_file_size:
+            raise VDMSizeLimitError("VDM file exceeds its size limit")
 
         # Find RMDX header
         idx = data.find(RMDX_SIGNATURE)
         if idx == -1:
             raise ValueError(f"RMDX signature not found in {self.path}")
 
-        # RMDX header format (per Windows Defender documentation):
-        # offset, size = struct.unpack("II", data[base + 0x18: base + 0x20])
-        # decompressed = zlib.decompress(data[base + offset + 8:], -15)
-        decompressed = None
+        view = memoryview(data)
 
-        # Primary layout: offset at +0x18, size at +0x1C
+        # Primary layout: offset at +0x18. The length at +0x1C describes
+        # expanded data in Microsoft files, not the compressed span. Enforce
+        # our actual byte budget regardless of this advisory header value.
         try:
-            offset_rel, comp_size = struct.unpack_from('<II', data, idx + 0x18)
+            offset_rel, _ = struct.unpack_from('<II', data, idx + 0x18)
 
             # The compressed data starts at base + offset + 8 (skip 8-byte header)
             compressed_start = idx + offset_rel + 8
-            compressed = data[compressed_start:]
-
-            # Decompress using raw deflate (wbits=-15)
-            decompressed = zlib.decompress(compressed, wbits=-15)
-        except (struct.error, zlib.error) as e:
+            if idx + 32 <= compressed_start < len(data):
+                self._inflate_to(view[compressed_start:], -15, output)
+                return
+        except (struct.error, zlib.error):
             pass
 
         # Fallback layout 1: offset at +8, size at +12
-        if decompressed is None:
-            try:
-                offset_rel = struct.unpack_from('<I', data, idx + 8)[0]
-                comp_size = struct.unpack_from('<I', data, idx + 12)[0]
+        try:
+            offset_rel, comp_size = struct.unpack_from('<II', data, idx + 8)
+            compressed_start = idx + offset_rel
+            compressed_end = compressed_start + comp_size
 
-                if offset_rel < 1024 and comp_size > 0 and comp_size < len(data):
-                    compressed = data[idx + offset_rel:idx + offset_rel + comp_size]
-                    try:
-                        decompressed = zlib.decompress(compressed, wbits=-15)
-                    except zlib.error:
-                        decompressed = zlib.decompress(compressed)
-            except (struct.error, zlib.error):
-                pass
+            if 16 <= offset_rel < 1024 and comp_size > 0 and compressed_end <= len(data):
+                compressed = view[compressed_start:compressed_end]
+                try:
+                    self._inflate_to(compressed, -15, output)
+                except zlib.error:
+                    self._inflate_to(compressed, zlib.MAX_WBITS, output)
+                return
+        except (struct.error, zlib.error):
+            pass
 
         # Fallback layout 2: Search for zlib header
-        if decompressed is None:
-            for test_offset in range(idx, min(idx + 64, len(data) - 2)):
-                if data[test_offset:test_offset + 2] in (b'\x78\x9c', b'\x78\x01', b'\x78\xda'):
-                    try:
-                        decompressed = zlib.decompress(data[test_offset:])
-                        break
-                    except zlib.error:
-                        continue
+        for test_offset in range(idx, min(idx + 64, len(data) - 2)):
+            if data[test_offset:test_offset + 2] in (b'\x78\x9c', b'\x78\x01', b'\x78\xda'):
+                try:
+                    self._inflate_to(view[test_offset:], zlib.MAX_WBITS, output)
+                    return
+                except zlib.error:
+                    continue
 
-        if decompressed is None:
-            raise ValueError(f"Could not decompress VDM data from {self.path}")
-
-        self._decompressed = decompressed
-        return decompressed
+        raise ValueError(f"Could not decompress VDM data from {self.path}")
 
     def parse_tlv_stream(self, data: Optional[bytes] = None) -> Iterator[Signature]:
         """
@@ -242,12 +300,13 @@ class VDMParser:
             signatures = list(self.parse_tlv_stream(decompressed))
             sig_count = len(signatures)
             decomp_size = len(decompressed)
+        except VDMSizeLimitError:
+            raise
         except Exception:
             sig_count = 0
             decomp_size = 0
 
-        with open(self.path, 'rb') as f:
-            comp_size = len(f.read())
+        comp_size = self.path.stat().st_size
 
         return VDMInfo(
             path=str(self.path),

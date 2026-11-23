@@ -21,9 +21,14 @@ export default function Dashboard() {
   const { data: statusData, isError: statusError, refetch: retryStatus } = useQuery({
     queryKey: ['service-status'],
     queryFn: getServiceStatus,
-    refetchInterval: query => ['running', 'initializing'].includes(query.state.data?.data.status || '') ? 5000 : 60000,
+    refetchInterval: query => ['running', 'initializing'].includes(query.state.data?.data.status || '') || (query.state.data?.data.lua_pending || 0) > 0 ? 5000 : 60000,
   })
   const status = statusData?.data
+  const phases: Record<string, string> = {
+    queued: 'Waiting to start', starting: 'Starting sync', downloading: 'Downloading definitions',
+    parsing: 'Preparing definitions', importing: 'Importing threats', decompiling: 'Decompiling Lua scripts',
+    resolving_asr: 'Resolving ASR rules', completed: 'Complete', failed: 'Failed', interrupted: 'Interrupted',
+  }
   const syncing = status?.status === 'running' || status?.status === 'initializing'
   const { data: statsData, isLoading, isError: statsError, refetch: retryStats } = useQuery({
     queryKey: ['stats'],
@@ -77,10 +82,16 @@ export default function Dashboard() {
         <div role="status" className="p-4 mb-6 border border-border-visible text-text-dim text-sm">
           <p>{status?.status === 'initializing' ? 'Initial definitions are not ready yet.' : 'A definition update is in progress.'} This page refreshes automatically.</p>
           {status?.sync_started_at && <p className="mt-1">Started {new Date(status.sync_started_at).toLocaleString()}</p>}
+          <p className="mt-1">{phases[status?.phase || ''] || 'Preparing definitions'} · {Math.floor((status?.elapsed_seconds || 0) / 60)} min elapsed</p>
+          {status?.phase === 'importing' && <p className="mt-1">{status.threats_processed.toLocaleString()} of {status.threats_total.toLocaleString()} threats processed in files parsed so far</p>}
+          {status?.phase === 'decompiling' && <p className="mt-1">Lua: {status.lua_completed.toLocaleString()} completed · {status.lua_pending.toLocaleString()} pending · {status.lua_failed.toLocaleString()} failed</p>}
+          {status?.heartbeat_at && <p className="mt-1">Last activity {new Date(status.heartbeat_at).toLocaleTimeString()}</p>}
           <p className="mt-1">{status?.threats_added ?? 0} added · {status?.threats_updated ?? 0} updated · {status?.threats_removed ?? 0} removed</p>
         </div>
       )}
       {status?.status === 'failed' && <p role="alert" className="mb-6 text-sm text-red-400">The last update did not complete. Existing definitions may still be browsed; an administrator should check the sync logs.</p>}
+      {!syncing && !!status?.lua_pending && <p role="status" className="mb-6 text-sm text-text-dim">Definitions are available. Lua processing continues: {status.lua_completed.toLocaleString()} completed · {status.lua_pending.toLocaleString()} pending.</p>}
+      {!syncing && !!status?.lua_failed && <p role="status" className="mb-6 text-sm text-amber">Definitions are available. {status.lua_failed.toLocaleString()} Lua scripts could not be decompiled; an administrator can inspect the failures and retry them.</p>}
       {stale && <p className="mb-6 text-sm text-amber">The last successful sync was over 48 hours ago.</p>}
 
       {/* Quick Search */}

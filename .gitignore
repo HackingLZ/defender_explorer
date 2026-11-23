@@ -1,11 +1,18 @@
 # Secrets & credentials
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+.aws/
+.ssh/
+*.key
+*.p12
+*.pfx
 
 # Claude Code project notes (may contain deployment details)
 CLAUDE.md
 .claude/
+.agents/
+.codex/
 
 # Python
 __pycache__/
@@ -20,6 +27,7 @@ frontend/dist/
 
 # Playwright test artifacts
 .playwright-cli/
+output/playwright/
 
 # Data & database volumes — track dir structure, ignore content
 data/vdm/*
@@ -27,6 +35,10 @@ data/vdm/*
 data/extracted/*
 !data/extracted/.gitkeep
 postgres_data/
+*.vdm
+*.dump
+*.sql.gz
+*.backup
 
 # Docker local overrides
 docker-compose.override.yml

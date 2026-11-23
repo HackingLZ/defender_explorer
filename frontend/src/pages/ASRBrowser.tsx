@@ -58,7 +58,7 @@ function exportAllASR(rules: ASRRule[]) {
 export default function ASRBrowser() {
   const [searchQuery, setSearchQuery] = useState('')
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['asr-rules'],
     queryFn: () => getASRRules(),
   })
@@ -99,6 +99,13 @@ export default function ASRBrowser() {
 
   if (isLoading) {
     return <LoadingSpinner />
+  }
+
+  if (isError) {
+    return <div role="alert" className="p-6 border border-red-500/30 text-red-400">
+      <p>ASR rules could not be loaded.</p>
+      <button type="button" onClick={() => refetch()} className="mt-2 underline">Retry</button>
+    </div>
   }
 
   return (

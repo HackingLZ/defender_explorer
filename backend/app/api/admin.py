@@ -17,7 +17,9 @@ from ..models import Threat, Signature, LuaScript, ASRRule, VDMVersion, SyncStat
 from ..rate_limit import limiter as _limiter
 from ..schemas.common import StatsResponse, SyncStatusResponse
 from ..services.sync_service import run_sync, run_local_import
+from ..services.sync_lifecycle import reserve_sync, exclusive_sync, SyncBusy
 from ..services.extracted_import_service import import_extracted_data
+from ..services.import_files import read_import_text
 from ..services.yara_service import get_available_rules
 from ..services.scheduler_service import get_schedule_status, set_schedule
 
@@ -35,6 +37,14 @@ async def require_api_key(x_api_key: str = Header()):
 
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
+
+
+async def _reserve_sync(db):
+    try:
+        return await reserve_sync(db)
+    except SyncBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
 
 # Default paths for local VDM files
 DEFAULT_VDM_PATHS = [
@@ -137,21 +147,7 @@ async def trigger_sync(
 
 ):
     """Trigger a new sync operation (download from Microsoft)."""
-    # Check if sync is already running
-    running_query = select(SyncStatus).where(SyncStatus.status == "running")
-    running = (await db.execute(running_query)).scalar()
-
-    if running:
-        raise HTTPException(status_code=409, detail="Sync already in progress")
-
-    # Create new sync status
-    sync_status = SyncStatus(
-        started_at=datetime.utcnow(),
-        status="running",
-    )
-    db.add(sync_status)
-    await db.commit()
-    await db.refresh(sync_status)
+    sync_status = await _reserve_sync(db)
 
     # Start sync in background
     background_tasks.add_task(run_sync, sync_status.id)
@@ -218,13 +214,6 @@ async def import_local_vdm(
 ):
     """Import from a local VDM file."""
     _ensure_imports_enabled()
-    # Check if sync is already running
-    running_query = select(SyncStatus).where(SyncStatus.status == "running")
-    running = (await db.execute(running_query)).scalar()
-
-    if running:
-        raise HTTPException(status_code=409, detail="Import already in progress")
-
     # Find VDM file
     vdm_path = request.vdm_path
     if vdm_path:
@@ -242,14 +231,7 @@ async def import_local_vdm(
             detail="VDM file not found"
         )
 
-    # Create new sync status
-    sync_status = SyncStatus(
-        started_at=datetime.utcnow(),
-        status="running",
-    )
-    db.add(sync_status)
-    await db.commit()
-    await db.refresh(sync_status)
+    sync_status = await _reserve_sync(db)
 
     # Start import in background
     background_tasks.add_task(run_local_import, sync_status.id, vdm_path)
@@ -296,28 +278,15 @@ async def import_extracted_endpoint(
 ):
     """Import pre-extracted data (ASR scripts, IOCs, hashes)."""
     _ensure_imports_enabled()
-    # Check if sync is already running
-    running_query = select(SyncStatus).where(SyncStatus.status == "running")
-    running = (await db.execute(running_query)).scalar()
-
-    if running:
-        raise HTTPException(status_code=409, detail="Import already in progress")
-
     if not os.path.exists(EXTRACTED_PATH):
         raise HTTPException(
             status_code=404,
             detail="Extracted data directory not found"
         )
 
-    # Create sync status
-    sync_status = SyncStatus(
-        started_at=datetime.utcnow(),
-        status="running",
-    )
-    db.add(sync_status)
-    await db.commit()
-    await db.refresh(sync_status)
+    sync_status = await _reserve_sync(db)
 
+    @exclusive_sync
     async def run_extracted_import(sync_id: int):
         from ..database import async_session_maker
         async with async_session_maker() as session:
@@ -336,6 +305,7 @@ async def import_extracted_endpoint(
                 )
                 await session.commit()
             except Exception:
+                await session.rollback()
                 logger.exception("Extracted import %s failed", sync_id)
                 await session.execute(
                     update(SyncStatus)
@@ -493,7 +463,7 @@ async def import_lua_scripts_from_path(
     # Walk through all .lua files
     for lua_file in lua_dir.rglob("*.lua"):
         try:
-            content = lua_file.read_text(errors="replace")
+            content = read_import_text(lua_dir, lua_file)
             # Remove null bytes and problematic characters
             content = content.replace('\x00', '').replace('\x13', '').replace('\x0f', '')
             bytecode_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -628,28 +598,15 @@ async def extract_and_import_v2(
     """
     _ensure_imports_enabled()
 
-    # Check if sync is already running
-    running_query = select(SyncStatus).where(SyncStatus.status == "running")
-    running = (await db.execute(running_query)).scalar()
-
-    if running:
-        raise HTTPException(status_code=409, detail="Import already in progress")
-
     # Validate paths if provided
     if import_request.vdm_path:
         validate_import_path(import_request.vdm_path)
     if import_request.extracted_path:
         validate_import_path(import_request.extracted_path)
 
-    # Create sync status
-    sync_status = SyncStatus(
-        started_at=datetime.utcnow(),
-        status="running",
-    )
-    db.add(sync_status)
-    await db.commit()
-    await db.refresh(sync_status)
+    sync_status = await _reserve_sync(db)
 
+    @exclusive_sync
     async def run_import_v2(sync_id: int):
         from ..database import async_session_maker
         from ..services.import_service_v2 import ImportServiceV2
@@ -676,6 +633,7 @@ async def extract_and_import_v2(
                 )
                 await session.commit()
             except Exception:
+                await session.rollback()
                 logger.exception("V2 import %s failed", sync_id)
                 await session.execute(
                     update(SyncStatus)
@@ -718,13 +676,6 @@ async def import_from_extracted_v2(
     """
     _ensure_imports_enabled()
 
-    # Check if sync is already running
-    running_query = select(SyncStatus).where(SyncStatus.status == "running")
-    running = (await db.execute(running_query)).scalar()
-
-    if running:
-        raise HTTPException(status_code=409, detail="Import already in progress")
-
     lua_dir = Path(EXTRACTED_PATH) / "lua"
     if not lua_dir.exists():
         raise HTTPException(
@@ -732,15 +683,9 @@ async def import_from_extracted_v2(
             detail="Lua directory not found. Run extraction first."
         )
 
-    # Create sync status
-    sync_status = SyncStatus(
-        started_at=datetime.utcnow(),
-        status="running",
-    )
-    db.add(sync_status)
-    await db.commit()
-    await db.refresh(sync_status)
+    sync_status = await _reserve_sync(db)
 
+    @exclusive_sync
     async def run_import(sync_id: int):
         from ..database import async_session_maker
         from ..services.import_service_v2 import ImportServiceV2
@@ -766,6 +711,7 @@ async def import_from_extracted_v2(
                 )
                 await session.commit()
             except Exception:
+                await session.rollback()
                 logger.exception("Lua import %s failed", sync_id)
                 await session.execute(
                     update(SyncStatus)
@@ -916,3 +862,31 @@ async def list_function_categories(
             for row in result.all()
         ]
     }
+
+
+@router.get("/decompilation/failures")
+async def list_decompilation_failures(limit: int = Query(200, ge=1, le=500), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(LuaScript.id, LuaScript.bytecode_hash,
+                                   LuaScript.decompilation_error, LuaScript.decompilation_attempts)
+                            .where(LuaScript.decompilation_status == "failed")
+                            .order_by(LuaScript.id).limit(limit))).mappings().all()
+    return [dict(row) for row in rows]
+
+
+class RetryDecompilationRequest(BaseModel):
+    script_ids: list[int] | None = None
+
+
+@router.post("/decompilation/retry")
+async def retry_decompilation(request: RetryDecompilationRequest, db: AsyncSession = Depends(get_db)):
+    if request.script_ids is not None and len(request.script_ids) > 500:
+        raise HTTPException(status_code=422, detail="Retry at most 500 scripts per request")
+    query = select(LuaScript.id).where(LuaScript.decompilation_status == "failed", LuaScript.bytecode.isnot(None))
+    if request.script_ids is not None:
+        query = query.where(LuaScript.id.in_(request.script_ids))
+    ids = (await db.execute(query.order_by(LuaScript.id).limit(500))).scalars().all()
+    if ids:
+        await db.execute(update(LuaScript).where(LuaScript.id.in_(ids), LuaScript.decompilation_status == "failed")
+                         .values(decompilation_status="pending", decompilation_error=None))
+        await db.commit()
+    return {"queued": len(ids), "script_ids": ids}

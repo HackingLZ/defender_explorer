@@ -1,4 +1,4 @@
-import { useParams, Link } from 'react-router-dom'
+import { useParams, useLocation, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { getSignature, getSingleSignatureDownloadUrl, getSingleSignatureYaraUrl } from '../api/client'
 import LoadingSpinner from '../components/LoadingSpinner'
@@ -6,12 +6,16 @@ import { ArrowLeft, AlertTriangle, Hash, Download, FileText } from 'lucide-react
 
 export default function SignatureDetail() {
   const { signatureId } = useParams()
+  const location = useLocation()
+  const from = location.state?.from
+  const backTo = typeof from === 'string' && (from === '/signatures' || from.startsWith('/signatures?')) ? from : '/signatures'
   const parsedId = signatureId ? Number(signatureId) : NaN
 
   const {
     data: sigData,
     isLoading,
     isError,
+    refetch,
   } = useQuery({
     queryKey: ['signature', parsedId],
     queryFn: () => getSignature(parsedId).then(r => r.data),
@@ -40,7 +44,8 @@ export default function SignatureDetail() {
     return (
       <div className="p-6">
         <div className="bg-bg-surface border border-border-visible p-6 text-text-dim">
-          Failed to load signature.
+          <p>Failed to load signature.</p>
+          <button type="button" onClick={() => refetch()} className="mt-2 underline">Retry</button>
         </div>
       </div>
     )
@@ -51,7 +56,7 @@ export default function SignatureDetail() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Link
-            to="/signatures"
+            to={backTo}
             className="inline-flex items-center gap-2 text-text-dim hover:text-text-bright"
           >
             <ArrowLeft className="h-4 w-4" />

@@ -40,10 +40,20 @@ async def get_public_status(db: AsyncSession = Depends(get_db)):
     last_sync = (await db.execute(select(func.max(SyncStatus.completed_at))
                                  .where(SyncStatus.status == "completed"))).scalar()
     progress = running or latest
+    lua = dict((await db.execute(select(LuaScript.decompilation_status, func.count(LuaScript.id))
+                                 .group_by(LuaScript.decompilation_status))).all())
     status = "running" if running else "failed" if latest and latest.status == "failed" else "ready" if current else "initializing"
     return {
         "status": status, "last_sync": _utc(last_sync), "current_version": current,
         "sync_started_at": _utc(progress.started_at) if progress else None,
+        "phase": progress.phase if progress else None,
+        "heartbeat_at": _utc(progress.heartbeat_at) if progress else None,
+        "elapsed_seconds": max(0, int(((progress.completed_at or datetime.utcnow()) - progress.started_at).total_seconds())) if progress else 0,
+        "threats_processed": (progress.threats_processed or 0) if progress else 0,
+        "threats_total": (progress.threats_total or 0) if progress else 0,
+        "lua_completed": lua.get("completed", 0),
+        "lua_failed": lua.get("failed", 0),
+        "lua_pending": lua.get("pending", 0),
         "threats_added": (progress.threats_added or 0) if progress else 0,
         "threats_updated": (progress.threats_updated or 0) if progress else 0,
         "threats_removed": (progress.threats_removed or 0) if progress else 0,

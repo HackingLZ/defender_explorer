@@ -23,7 +23,7 @@ import {
 import { type AxiosResponse } from 'axios'
 import LoadingSpinner from '../components/LoadingSpinner'
 import Pagination from '../components/Pagination'
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 
 function CategoryIcon({ category }: { category: string }) {
   const topLevel = category.split('/')[0]
@@ -72,6 +72,12 @@ function CategoryTree({
     new Set(selectedCategory ? [selectedCategory.split('/')[0]] : [])
   )
 
+  useEffect(() => {
+    if (selectedCategory) {
+      setExpandedCategories(previous => new Set([...previous, selectedCategory.split('/')[0]]))
+    }
+  }, [selectedCategory])
+
   // Group categories by top-level
   const groupedCategories = useMemo(() => {
     const groups: Record<string, CategoryCount[]> = {}
@@ -118,13 +124,14 @@ function CategoryTree({
       {Object.entries(groupedCategories).map(([topLevel, cats]) => {
         const isExpanded = expandedCategories.has(topLevel)
         const totalCount = cats.reduce((sum, c) => sum + c.count, 0)
-        const isSelected = selectedCategory?.startsWith(topLevel + '/')
+        const isSelected = selectedCategory?.split('/')[0] === topLevel
 
         return (
           <div key={topLevel}>
             {/* Top-level category header */}
             <button
               onClick={() => toggleExpand(topLevel)}
+              aria-expanded={isExpanded}
               className={`w-full flex items-center justify-between px-3 py-2 text-sm rounded-lg transition-colors ${
                 isSelected
                   ? 'bg-bg-elevated text-text-bright'
@@ -158,6 +165,7 @@ function CategoryTree({
                     <div key={cat.name}>
                       <button
                         onClick={() => onSelectCategory(cat.name, null)}
+                        aria-pressed={isSubSelected}
                         className={`w-full flex items-center justify-between px-3 py-1.5 text-sm rounded transition-colors ${
                           isSubSelected
                             ? 'bg-amber/20 text-amber'
@@ -171,12 +179,13 @@ function CategoryTree({
                       </button>
 
                       {/* Sub-subcategories if any */}
-                      {cat.subcategories && cat.subcategories.length > 0 && isSubSelected && (
+                      {cat.subcategories && cat.subcategories.length > 0 && selectedCategory === cat.name && (
                         <div className="ml-4 border-l border-border-dim pl-2 space-y-0.5 mt-1">
                           {cat.subcategories.map((sub) => (
                             <button
                               key={sub.name}
                               onClick={() => onSelectCategory(cat.name, sub.name)}
+                              aria-pressed={selectedSubcategory === sub.name}
                               className={`w-full flex items-center justify-between px-2 py-1 text-xs rounded transition-colors ${
                                 selectedSubcategory === sub.name
                                   ? 'bg-amber/20 text-amber'
@@ -208,25 +217,38 @@ export default function Signatures() {
   const [searchInput, setSearchInput] = useState(searchParams.get('q') || '')
   const [showMobileSidebar, setShowMobileSidebar] = useState(false)
 
-  const searchQuery = searchParams.get('q')
+  const searchQuery = (searchParams.get('q') || '').trim()
   const category = searchParams.get('category')
   const subcategory = searchParams.get('subcategory')
-  const page = parseInt(searchParams.get('page') || '1', 10)
+  const parsedPage = Number(searchParams.get('page') || '1')
+  const page = Number.isSafeInteger(parsedPage) && parsedPage > 0 ? parsedPage : 1
+  const invalidSearch = searchQuery.length > 0 && searchQuery.length < 2
+
+  useEffect(() => { setSearchInput(searchQuery) }, [searchQuery])
+
+  useEffect(() => {
+    if (!showMobileSidebar) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowMobileSidebar(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [showMobileSidebar])
 
   // Fetch categories
-  const { data: categoriesData, isLoading: categoriesLoading } = useQuery({
+  const { data: categoriesData, isLoading: categoriesLoading, isError: categoriesError, refetch: retryCategories } = useQuery({
     queryKey: ['signature-categories'],
     queryFn: () => getSignatureCategories(),
   })
 
   // Fetch results - either search or browse
-  const { data: resultsData, isLoading: resultsLoading } = useQuery<
+  const { data: resultsData, isLoading: resultsLoading, isFetching, isError: resultsError, refetch: retryResults } = useQuery<
     AxiosResponse<SignatureBrowseResponse | SignatureSearchResponse>
   >({
     queryKey: ['signatures', searchQuery, category, subcategory, page],
     queryFn: async () => {
       if (searchQuery) {
-        return searchSignatures({ q: searchQuery, category: category || undefined, page })
+        return searchSignatures({ q: searchQuery, category: category || undefined, subcategory: subcategory || undefined, page })
       } else {
         return browseSignatures({
           category: category || undefined,
@@ -235,6 +257,7 @@ export default function Signatures() {
         })
       }
     },
+    enabled: !invalidSearch,
   })
 
   const categories = categoriesData?.data?.categories || []
@@ -243,7 +266,7 @@ export default function Signatures() {
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
     if (searchInput.trim()) {
-      setSearchParams({ q: searchInput.trim(), ...(category && { category }) })
+      setSearchParams({ q: searchInput.trim(), ...(category && { category }), ...(subcategory && { subcategory }) })
     } else {
       // Clear search, keep category
       const params: Record<string, string> = {}
@@ -277,28 +300,26 @@ export default function Signatures() {
     setSearchParams(params)
   }
 
-  if (categoriesLoading) {
-    return <LoadingSpinner />
-  }
-
   return (
     <div>
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-3xl font-bold text-text-bright">Signature Browser</h1>
         <p className="mt-2 text-text-dim">
-          Browse and search {formatCount(categoriesData?.data?.total || 0)} signatures by
-          category
+          Browse and search {categoriesData ? `${formatCount(categoriesData.data.total)} signatures` : 'signatures'} by category
         </p>
       </div>
 
       {/* Search Bar */}
       <div className="bg-bg-surface rounded-xl border border-border-visible p-4 mb-6">
-        <form onSubmit={handleSearch} className="flex items-center gap-3">
-          <div className="relative flex-1">
+        <form onSubmit={handleSearch} className="flex flex-wrap items-center gap-3">
+          <div className="relative flex-1 min-w-[180px]">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-text-muted" />
             <input
               type="text"
+              aria-label="Search signature content"
+              aria-describedby="signature-search-help"
+              minLength={2}
               placeholder="Search signature content (e.g., powershell.exe, CurrentVersion\Run)..."
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
@@ -321,6 +342,7 @@ export default function Signatures() {
             </button>
           )}
         </form>
+        <p id="signature-search-help" className="mt-2 text-xs text-text-muted">Enter at least 2 characters. Search applies within the selected category and subcategory.</p>
       </div>
 
       <div className="flex gap-6 min-h-[calc(100vh-12rem)]">
@@ -336,7 +358,7 @@ export default function Signatures() {
         <div
           className={`
             fixed inset-y-0 left-0 z-50 w-72 bg-bg-deep transform transition-transform duration-200 lg:relative lg:transform-none lg:z-auto lg:bg-transparent
-            ${showMobileSidebar ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
+            ${showMobileSidebar ? 'translate-x-0 visible' : '-translate-x-full invisible lg:translate-x-0 lg:visible'}
             lg:w-64 lg:flex-shrink-0
           `}
         >
@@ -347,13 +369,19 @@ export default function Signatures() {
               </h2>
               <button
                 onClick={() => setShowMobileSidebar(false)}
+                aria-label="Close signature categories"
                 className="lg:hidden p-1 text-text-muted hover:text-text-bright"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
             <div className="max-h-[calc(100vh-10rem)] overflow-y-auto">
-              <CategoryTree
+              {categoriesLoading ? <LoadingSpinner /> : categoriesError ? (
+                <div role="alert" className="text-sm text-red-400">
+                  <p>Categories could not be loaded.</p>
+                  <button onClick={() => retryCategories()} className="mt-2 underline">Retry categories</button>
+                </div>
+              ) : <CategoryTree
                 categories={categories}
                 selectedCategory={category}
                 selectedSubcategory={subcategory}
@@ -361,7 +389,7 @@ export default function Signatures() {
                   handleSelectCategory(cat, subcat)
                   setShowMobileSidebar(false)
                 }}
-              />
+              />}
             </div>
           </div>
         </div>
@@ -370,35 +398,46 @@ export default function Signatures() {
         <div className="flex-1 min-w-0">
           <div className="bg-bg-surface rounded-xl border border-border-visible overflow-hidden">
             {/* Results header */}
-            <div className="px-4 sm:px-6 py-4 border-b border-border-dim flex justify-between items-center gap-2">
-              <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            <div className="px-4 sm:px-6 py-4 border-b border-border-dim flex flex-wrap justify-between items-center gap-2">
+              <div className="flex flex-1 items-center gap-2 sm:gap-3 min-w-0">
                 <button
                   onClick={() => setShowMobileSidebar(true)}
+                  aria-label="Open signature categories"
+                  aria-expanded={showMobileSidebar}
                   className="lg:hidden p-1.5 text-text-muted hover:text-text-bright border border-border-dim rounded flex-shrink-0"
                 >
                   <PanelLeftOpen className="h-4 w-4" />
                 </button>
                 {searchQuery && (
-                  <span className="text-sm text-text-bright">
+                  <span className="text-sm text-text-bright break-all">
                     Results for "{searchQuery}"
                   </span>
                 )}
                 {category && !searchQuery && (
-                  <span className="text-sm text-text-bright">{category}</span>
+                  <span className="text-sm text-text-bright break-all">{category}</span>
                 )}
                 {subcategory && (
-                  <span className="text-xs px-2 py-0.5 bg-amber/20 text-amber rounded">
+                  <span className="text-xs px-2 py-0.5 bg-amber/20 text-amber rounded break-all">
                     {subcategory}
                   </span>
                 )}
               </div>
-              <span className="text-sm text-text-muted">
-                {results ? formatCount(results.total) : 0} signatures
+              <span className="w-full sm:w-auto shrink-0 text-sm text-text-muted" role="status">
+                {resultsLoading ? 'Loading…' : resultsError || invalidSearch ? 'Results unavailable' : results ? `${results.total.toLocaleString()} ${results.total === 1 ? 'signature' : 'signatures'}` : ''}
               </span>
             </div>
 
             {/* Results list */}
-            {resultsLoading ? (
+            {invalidSearch ? (
+              <div role="alert" className="p-8 text-center text-amber">Enter at least 2 characters to search signature content.</div>
+            ) : resultsError ? (
+              <div role="alert" className="p-8 text-center">
+                <p className="text-red-400">Signatures could not be loaded. Please try again.</p>
+                <button onClick={() => retryResults()} disabled={isFetching} className="mt-3 text-amber underline disabled:opacity-50">
+                  {isFetching ? 'Retrying…' : 'Retry signatures'}
+                </button>
+              </div>
+            ) : resultsLoading ? (
               <div className="p-8">
                 <LoadingSpinner />
               </div>
@@ -408,6 +447,7 @@ export default function Signatures() {
                   <Link
                     key={item.id}
                     to={`/signatures/${item.id}`}
+                    state={{ from: `/signatures?${searchParams.toString()}` }}
                     className="flex items-start justify-between px-6 py-4 hover:bg-bg-elevated transition-colors group"
                   >
                     <div className="min-w-0 flex-1">
@@ -438,14 +478,19 @@ export default function Signatures() {
               </div>
             ) : (
               <div className="p-8 text-center text-text-muted">
-                {searchQuery
+                <p>{page > 1 ? 'No signatures on this page.' : searchQuery
                   ? 'No signatures found matching your search.'
-                  : 'Select a category or search to view signatures.'}
+                  : 'No signatures found in this selection.'}</p>
+                {page > 1 ? (
+                  <button onClick={() => handlePageChange(1)} className="mt-3 text-amber underline">Go to first page</button>
+                ) : (searchQuery || category || subcategory) && (
+                  <button onClick={() => setSearchParams({})} className="mt-3 text-amber underline">Clear search and filters</button>
+                )}
               </div>
             )}
 
             {/* Pagination */}
-            {results && results.pages > 1 && (
+            {!resultsError && !invalidSearch && results && results.items.length > 0 && results.pages > 1 && (
               <div className="px-6 py-4 border-t border-border-dim">
                 <Pagination
                   page={results.page}

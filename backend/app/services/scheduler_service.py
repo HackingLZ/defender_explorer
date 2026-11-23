@@ -144,14 +144,12 @@ async def _scheduler_loop():
 
         try:
             async with async_session_maker() as db:
-                # Create sync status
-                sync_status = SyncStatus(
-                    started_at=datetime.utcnow(),
-                    status="running",
-                )
-                db.add(sync_status)
-                await db.commit()
-                await db.refresh(sync_status)
+                from .sync_lifecycle import reserve_sync, SyncBusy
+                try:
+                    sync_status = await reserve_sync(db)
+                except SyncBusy:
+                    logger.info("Skipping scheduled sync: another import owns the sync lock")
+                    continue
 
                 # Trigger sync (runs in current task)
                 await run_sync(sync_status.id)
@@ -173,3 +171,12 @@ async def start_scheduler_on_startup():
     else:
         logger.info("No saved schedule found, enabling default 3 AM daily sync")
         await set_schedule(True, "03:00")
+
+
+async def stop_scheduler():
+    """Stop timers and await cancellation of any owned sync on shutdown."""
+    global _scheduler_task
+    if _scheduler_task:
+        _scheduler_task.cancel()
+        await asyncio.gather(_scheduler_task, return_exceptions=True)
+        _scheduler_task = None
